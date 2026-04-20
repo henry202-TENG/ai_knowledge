@@ -177,8 +177,372 @@ def flash_decoding(q, kv_cache, block_size=512):
 
 ---
 
+## 7. 記憶體計算詳細
+
+### KV Cache 記憶體佔用
+
+```
+單層 Transformer 的 KV Cache 大小:
+
+假設:
+  - 序列長度 n = 4096
+  - 隱藏維度 d = 4096
+  - 頭數 h = 32
+  - 每頭維度 d_head = 128
+  - 數據類型: FP16 (2 bytes)
+
+每層的 KV Cache:
+  KV = 2 × n × h × d_head × 2 (K + V)
+     = 2 × 4096 × 32 × 128 × 2
+     = 64 MB
+
+整個模型 (32 層):
+  Total = 64 MB × 32 = 2 GB
+
+多請求並發:
+  - 10 個請求: 20 GB
+  - 100 個請求: 200 GB
+```
+
+### 記憶體優化公式
+
+```python
+def calculate_kv_cache_memory(
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    dtype_bytes: int = 2
+):
+    """計算 KV Cache 記憶體"""
+
+    # 每個 token 的 K/V 大小
+    per_token = num_heads * head_dim * dtype_bytes  # bytes
+
+    # K + V
+    per_token *= 2
+
+    # 完整序列
+    full_cache = per_token * max_seq_len
+
+    # 考慮所有層
+    total = full_cache * num_layers
+
+    # 轉換為 MB
+    return total / (1024 ** 2)
+```
+
+---
+
+## 8. 注意力機制深入
+
+### 多頭注意力計算
+
+```python
+def multi_head_attention(
+    Q, K, V,
+    num_heads: int,
+    head_dim: int
+):
+    """
+    Q: [batch, seq_q, d_model]
+    K, V: [batch, seq_kv, d_model]
+    """
+
+    batch_size = Q.size(0)
+
+    # 投影到 Q, K, V
+    Q = Q.view(batch_size, -1, num_heads, head_dim).transpose(1, 2)
+    K = K.view(batch_size, -1, num_heads, head_dim).transpose(1, 2)
+    V = V.view(batch_size, -1, num_heads, head_dim).transpose(1, 2)
+
+    # 計算 Attention
+    # [batch, heads, seq_q, seq_kv]
+    attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (head_dim ** 0.5)
+    attn_weights = F.softmax(attn_scores, dim=-1)
+
+    # 輸出
+    output = torch.matmul(attn_weights, V)
+    output = output.transpose(1, 2).contiguous().view(
+        batch_size, -1, num_heads * head_dim
+    )
+
+    return output
+```
+
+### KV Cache 下的推理
+
+```python
+def decode_with_cache(
+    model,
+    input_ids: torch.Tensor,  # [batch, seq_len]
+    kv_cache: dict,
+    layer_idx: int
+):
+    """使用 KV Cache 進行解碼"""
+
+    # 取得最後一個 token
+    last_token = input_ids[:, -1:]
+
+    # 計算 Q (只需要最後一個位置)
+    Q = model.embed(last_token)
+    Q = model.layers[layer_idx].attention.W_q(Q)
+    Q = Q.view(Q.size(0), 1, model.num_heads, model.head_dim)
+
+    # 取得快取的 K, V
+    cached_K = kv_cache[f"layer_{layer_idx}_K"]
+    cached_V = kv_cache[f"layer_{layer_idx}_V"]
+
+    # 計算新的 K, V
+    new_K = model.layers[layer_idx].attention.W_k(last_token)
+    new_V = model.layers[layer_idx].attention.W_v(last_token)
+    new_K = new_K.view(new_K.size(0), 1, model.num_heads, model.head_dim)
+    new_V = new_V.view(new_V.size(0), 1, model.num_heads, model.head_dim)
+
+    # 追加到快取
+    K = torch.cat([cached_K, new_K], dim=2)
+    V = torch.cat([cached_V, new_V], dim=2)
+
+    # 更新快取
+    kv_cache[f"layer_{layer_idx}_K"] = K
+    kv_cache[f"layer_{layer_idx}_V"] = V
+
+    # 計算 Attention
+    attn = torch.matmul(Q, K.transpose(-2, -1)) / (model.head_dim ** 0.5)
+    attn = F.softmax(attn, dim=-1)
+    output = torch.matmul(attn, V)
+
+    return output.squeeze(1), kv_cache
+```
+
+---
+
+## 9. 進階快取策略
+
+### 分層 KV Cache
+
+```python
+class HierarchicalKVCache:
+    """分層 KV Cache: GPU + CPU + 磁碟"""
+
+    def __init__(self, gpu_capacity_mb=10000, cpu_capacity_mb=100000):
+        self.gpu_cache = {}   # 熱數據
+        self.cpu_cache = {}   # 溫數據
+        self.disk_cache = {}  # 冷數據
+        self.gpu_capacity = gpu_capacity_mb
+        self.cpu_capacity = cpu_capacity_mb
+
+    def get(self, key):
+        """分層獲取"""
+        if key in self.gpu_cache:
+            return self.gpu_cache[key]
+        elif key in self.cpu_cache:
+            data = self.cpu_cache.pop(key)
+            self.gpu_cache[key] = data  # 升級到 GPU
+            return data
+        elif key in self.disk_cache:
+            data = self.disk_cache.pop(key)
+            self.cpu_cache[key] = data  # 升級到 CPU
+            return data
+        return None
+
+    def put(self, key, value):
+        """分層存放"""
+        size_mb = value.numel() * value.element_size() / (1024 ** 2)
+
+        if self.get_cache_size_mb() + size_mb > self.gpu_capacity:
+            # 驅逐到 CPU
+            self._evict_to_cpu()
+
+        self.gpu_cache[key] = value
+```
+
+### 主動快取策略
+
+```python
+class PredictiveKVCache:
+    """預測性 KV Cache"""
+
+    def __init__(self, model):
+        self.model = model
+        self.access_history = {}
+        self.prefetch_threshold = 0.8
+
+    def predict_and_prefetch(self, prompt):
+        """預測可能訪問的內容並預先載入"""
+
+        # 簡單預測: 根據歷史
+        likely_next = self._predict_next_tokens(prompt)
+
+        # 預先計算這些 token 的 K, V
+        prefetch_kv = {}
+        for token in likely_next:
+            kv = self.model.compute_kv(token)
+            prefetch_kv[token] = kv
+
+        return prefetch_kv
+
+    def _predict_next_tokens(self, prompt, top_k=4):
+        """簡單的下一 token 預測"""
+        with torch.no_grad():
+            logits = self.model(prompt)
+            probs = F.softmax(logits, dim=-1)
+            _, top_indices = probs.topk(top_k)
+            return top_indices.tolist()
+```
+
+---
+
+## 10. Prefill-Decode 排程
+
+### Split Prefill 策略
+
+```
+問題: Prefill 階段計算量大，會阻塞 Decode
+
+解決: 將 Prefill 分成多個小塊，與 Decode 交替執行
+
+時間線 (傳統):
+  [Prefill 5s][Decode 0.1s][Decode 0.1s]...
+                ↑ 阻塞很長時間
+
+時間線 (Split Prefill):
+  [P1 1s][Decode][P2 1s][Decode][P3 1s][Decode]...
+  ↑ 可交互響應
+```
+
+### 實現
+
+```python
+class SplitPrefillScheduler:
+    """Split Prefill 排程器"""
+
+    def __init__(self, chunk_size=512):
+        self.chunk_size = chunk_size
+
+    def schedule(self, requests):
+        """
+        混合排程 Prefill 和 Decode 請求
+        """
+        prefill_queue = [r for r in requests if r.is_prefill]
+        decode_queue = [r for r in requests if r.is_decode]
+
+        schedule = []
+
+        # 交替處理
+        while prefill_queue or decode_queue:
+            # 先處理 Decode (低延遲)
+            if decode_queue:
+                schedule.append(("decode", decode_queue.pop(0)))
+
+            # 每處理 N 個 Decode，執行一次 Prefill
+            if prefill_queue and len(schedule) % 3 == 0:
+                chunk = prefill_queue[0][:self.chunk_size]
+                schedule.append(("prefill", chunk))
+
+        return schedule
+```
+
+### Continuous Batching
+
+```python
+class ContinuousBatching:
+    """持續批處理: 動態加入新請求"""
+
+    def __init__(self, max_batch_size=16):
+        self.max_batch_size = max_batch_size
+        self.running_requests = []
+
+    def add_request(self, request):
+        """加入新請求"""
+        self.running_requests.append(request)
+
+        # 如果超過容量，等待
+        while len(self.running_requests) > self.max_batch_size:
+            time.sleep(0.01)
+
+    def step(self):
+        """執行一步"""
+
+        # 收集所有請求的下一 token
+        batch = [req.current_tokens for req in self.running_requests]
+
+        # 批量推理
+        next_tokens = self.model.generate_batch(batch)
+
+        # 更新每個請求
+        for req, token in zip(self.running_requests, next_tokens):
+            req.append(token)
+
+            # 完成的請求移除
+            if req.is_done():
+                self.running_requests.remove(req)
+
+        return next_tokens
+```
+
+---
+
+## 11. 量化深入
+
+### KV Cache 量化實現
+
+```python
+class KVCacheQuantizer:
+    def __init__(self, num_bits=8):
+        self.num_bits = num_bits
+
+    def quantize(self, tensor):
+        """量化 KV Cache"""
+
+        if self.num_bits == 8:
+            # INT8 量化
+            scale = tensor.abs().max() / 127
+            quantized = (tensor / scale).round().to(torch.int8)
+            return quantized, scale
+
+        elif self.num_bits == 4:
+            # INT4 量化 (使用 group)
+            group_size = 64
+            shape = tensor.shape
+            tensor = tensor.reshape(-1, group_size)
+
+            scale = tensor.abs().max(dim=1, keepdim=True)[0] / 7
+            quantized = (tensor / scale).round().to(torch.int8)
+
+            return quantized.reshape(shape), scale
+
+    def dequantize(self, quantized, scale):
+        """反量化"""
+        return quantized.float() * scale
+```
+
+### 量化精度權衡
+
+| 方法 | 困惑度變化 | 記憶體節省 |
+|------|-----------|-----------|
+| FP16 | 0 (baseline) | 1x |
+| INT8 | +0.5% | 2x |
+| INT4 | +2% | 4x |
+| NF4 | +1% | 4x |
+
+---
+
+## 12. 相關技術
+
+| 技術 | 關係 |
+|------|------|
+| **Speculative Decoding** | 依賴 KV Cache 加速驗證 |
+| **Context Window** | 需要更大的 KV Cache |
+| **PagedAttention** | KV Cache 的記憶體管理方案 |
+| **Flash Attention** | 與 KV Cache 互補的計算優化 |
+
+---
+
 ## 延伸閱讀
 
 - [vLLM PagedAttention Paper](https://arxiv.org/abs/2309.06180)
 - [FlashDecoding Paper](https://arxiv.org/abs/2311.06683)
 - [LLaMA2 Inference Optimization](https://ai.meta.com/research/publications/llama-2/)
+- [Continuous Batching](https://arxiv.org/abs/2308.12669)
+- [KV Cache Quantization](https://arxiv.org/abs/2312.02288)

@@ -291,8 +291,382 @@ def best_first_tot(initial_state):
 
 ---
 
+## 8. 數學形式化
+
+### ToT 形式化定義
+
+```
+ToT 可定義為五元組 (S, A, G, E, P):
+
+- S: 狀態空間
+  S = {s₀, s₁, s₂, ...}  // 所有可能的推理狀態
+
+- A: 動作空間
+  A(s) = {a₁, a₂, ..., aₖ}  // 從狀態 s 可執行的動作
+
+- G: 目標狀態
+  G ⊆ S  // 達成任務的狀態集合
+
+- E: 評估函數
+  E: S × policy → [0, 1]  // 評估狀態的價值
+
+- P: 搜索策略
+  P ∈ {BFS, DFS, Best-first, MCTS}
+```
+
+### 搜索複雜度
+
+| 參數 | 表達式 | 說明 |
+|------|--------|------|
+| 分支因子 | `b = avg(|A(s)|)` | 每個狀態的平均動作數 |
+| 深度 | `d` | 搜索深度 |
+| 總節點數 | `O(b^d)` | 搜索樹大小 |
+| BFS 記憶體 | `O(b^d)` | 需要儲存所有節點 |
+| DFS 記憶體 | `O(d)` | 只需要棧 |
+
+### 剪枝策略
+
+```python
+class ToTPruner:
+    """ToT 剪枝策略"""
+
+    def __init__(self, max_width=5, min_score_threshold=0.3):
+        self.max_width = max_width
+        self.min_score = min_score_threshold
+
+    def prune(self, states_with_scores):
+        """剪枝邏輯"""
+
+        # 1. 過濾低分狀態
+        filtered = [s for s, score in states_with_scores
+                   if score >= self.min_score]
+
+        # 2. 限制寬度
+        if len(filtered) > self.max_width:
+            # 保留 top-k
+            filtered = sorted(filtered,
+                           key=lambda x: x[1],
+                           reverse=True)[:self.max_width]
+
+        # 3. 去重
+        return self._deduplicate(filtered)
+
+    def _deduplicate(self, states):
+        """去除重複狀態"""
+        seen = set()
+        unique = []
+        for state in states:
+            state_key = self._hash_state(state)
+            if state_key not in seen:
+                seen.add(state_key)
+                unique.append(state)
+        return unique
+```
+
+---
+
+## 9. MCTS 變體
+
+### Monte Carlo Tree Search
+
+MCTS 結合隨機模擬與樹搜索，是 ToT 的進階版本：
+
+```
+四個階段:
+1. Selection: 選擇最有希望的節點
+2. Expansion: 擴展節點
+3. Simulation: 隨機模擬到目標
+4. Backpropagation: 更新節點分數
+```
+
+### MCTS ToT 實作
+
+```python
+class MCTSToT:
+    def __init__(self, exploration_constant=1.41):
+        self.C = exploration_constant  # UCB 探索常數
+        self.tree = {}  # state -> Node
+
+    class Node:
+        def __init__(self, state, parent=None):
+            self.state = state
+            self.parent = parent
+            self.children = []
+            self.visit_count = 0
+            self.total_score = 0
+
+        def ucb_score(self):
+            if self.visit_count == 0:
+                return float('inf')
+            exploitation = self.total_score / self.visit_count
+            exploration = self.C * np.sqrt(
+                np.log(self.parent.visit_count) / self.visit_count
+            )
+            return exploitation + exploration
+
+    def select(self, node):
+        """Selection: 選擇 UCB 分數最高的子節點"""
+        while node.children:
+            node = max(node.children, key=lambda x: x.ucb_score())
+        return node
+
+    def expand(self, node, thought):
+        """Expansion: 添加新節點"""
+        new_node = self.Node(thought, node)
+        node.children.append(new_node)
+        return new_node
+
+    def simulate(self, state):
+        """Simulation: 隨機模擬到目標"""
+        # 隨機生成後續步驟
+        # 返回模擬結果
+        return self._random_rollout(state)
+
+    def backpropagate(self, node, score):
+        """Backpropagation: 更新路徑上所有節點"""
+        while node:
+            node.visit_count += 1
+            node.total_score += score
+            node = node.parent
+
+    def search(self, initial_state, iterations=1000):
+        """完整 MCTS 搜索"""
+        root = self.Node(initial_state)
+        self.tree[initial_state] = root
+
+        for _ in range(iterations):
+            # 1. Selection
+            node = self.select(root)
+
+            # 2. Expansion
+            if not is_goal(node.state):
+                thoughts = generate_thoughts(node.state)
+                for thought in thoughts:
+                    self.expand(node, thought)
+                node = node.children[0]  # 選擇第一個子節點
+
+            # 3. Simulation
+            score = self.simulate(node.state)
+
+            # 4. Backpropagation
+            self.backpropagate(node, score)
+
+        return self.get_best_path(root)
+```
+
+### MCTS vs 傳統 ToT
+
+| 特性 | 傳統 ToT | MCTS ToT |
+|------|----------|----------|
+| 搜索策略 | 確定性 | 隨機性 |
+| 探索/利用 | 需手動平衡 | 自動平衡 |
+| 計算需求 | 高 | 中等 |
+| 實現難度 | 低 | 高 |
+
+---
+
+## 10. ToT + Function Calling
+
+### 整合架構
+
+```
+ToT 搜索 ─────────────────────────────────────────┐
+                                                │
+  每個狀態 ──► 評估 (E)                           │
+               │                                  │
+               ▼                                  │
+         需要外部驗證？ ──► Function Calling      │
+                              │                  │
+                              ▼                  │
+                        API 回傳結果 ──────────────┘
+```
+
+### 實作範例
+
+```python
+class ToTWithFunctionCalling:
+    def __init__(self, tools):
+        self.tools = tools
+
+    def evaluate_state_with_tools(self, state):
+        """使用 Function Calling 評估狀態"""
+
+        # 根據狀態類型選擇工具
+        tool_choice = self._select_evaluation_tool(state)
+
+        if tool_choice:
+            # 調用工具驗證
+            result = self._call_tool(tool_choice, state)
+
+            # 根據結果計算分數
+            return self._compute_score(result)
+        else:
+            # 使用 LLM 評估
+            return self._llm_evaluate(state)
+
+    def _select_evaluation_tool(self, state):
+        """根據狀態選擇評估工具"""
+
+        if state.type == "code":
+            return "execute_code"
+        elif state.type == "math":
+            return "calculate"
+        elif state.type == "search":
+            return "web_search"
+        return None
+
+    def _call_tool(self, tool_name, state):
+        """調用工具"""
+        if tool_name == "execute_code":
+            return self.tools["execute_code"](state.content)
+        elif tool_name == "calculate":
+            return self.tools["calculate"](state.expression)
+        # ...
+```
+
+### 工具選擇策略
+
+| 狀態類型 | 評估工具 | 優勢 |
+|----------|----------|------|
+| 數學計算 | Python interpreter | 精確驗證 |
+| 程式碼 | Code compiler | 語法錯誤檢測 |
+| 事實查詢 | Web search | 即時資訊 |
+| 天氣/股票 | Weather/Stock API | 準確數據 |
+
+---
+
+## 11. 效能優化
+
+### Token 優化策略
+
+```python
+class ToTTokenOptimizer:
+    def __init__(self, max_tokens_per_thought=200):
+        self.max_tokens = max_tokens_per_thought
+
+    def compress_thought(self, thought):
+        """壓縮思考內容"""
+
+        # 移除冗餘詞彙
+        compressed = self._remove_redundancy(thought)
+
+        # 截斷過長內容
+        if len(compressed) > self.max_tokens:
+            compressed = compressed[:self.max_tokens] + "..."
+
+        return compressed
+
+    def _remove_redundancy(self, text):
+        """移除冗餘"""
+        # 移除重複詞彙
+        words = text.split()
+        seen = set()
+        result = []
+        for word in words:
+            if word.lower() not in seen or len(word) > 3:
+                result.append(word)
+                seen.add(word.lower())
+        return " ".join(result)
+```
+
+### 批量評估
+
+```python
+async def batch_evaluate(states, evaluator, max_concurrent=10):
+    """批量評估多個狀態"""
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def eval_with_limit(state):
+        async with semaphore:
+            return await evaluator(state)
+
+    tasks = [eval_with_limit(s) for s in states]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 過濾錯誤
+    return [r for r in results if not isinstance(r, Exception)]
+```
+
+### 緩存策略
+
+```python
+from functools import lru_cache
+
+class CachedToT:
+    def __init__(self, ttl=300):
+        self.cache = {}
+        self.ttl = ttl
+
+    def get_cached_evaluation(self, state_hash):
+        """緩存評估結果"""
+        if state_hash in self.cache:
+            result, timestamp = self.cache[state_hash]
+            if time.time() - timestamp < self.ttl:
+                return result
+        return None
+```
+
+---
+
+## 12. 監控與診斷
+
+### 追蹤指標
+
+```python
+class ToTMonitor:
+    def __init__(self):
+        self.stats = {
+            "total_searches": 0,
+            "successful_searches": 0,
+            "total_nodes": [],
+            "path_lengths": [],
+            "evaluation_scores": []
+        }
+
+    def record_search(self, nodes, path_length, success):
+        self.stats["total_searches"] += 1
+        if success:
+            self.stats["successful_searches"] += 1
+        self.stats["total_nodes"].append(nodes)
+        self.stats["path_lengths"].append(path_length)
+
+    def get_metrics(self):
+        return {
+            "success_rate": self.stats["successful_searches"] /
+                          self.stats["total_searches"],
+            "avg_nodes": np.mean(self.stats["total_nodes"]),
+            "avg_path_length": np.mean(self.stats["path_lengths"]),
+            "p95_path_length": np.percentile(self.stats["path_lengths"], 95)
+        }
+```
+
+### 診斷問題
+
+| 問題 | 徵兆 | 解決方案 |
+|------|------|----------|
+| 搜索空間爆炸 | 節點數指數增長 | 增加剪枝 |
+| 局部最優 | 分數停滯不前 | 增加探索 |
+| 評估過慢 | 單次評估 > 10s | 批量評估 + 緩存 |
+| 記憶體不足 | OOM 錯誤 | 限制節點數 + 定期清理 |
+
+---
+
+## 13. 相關主題
+
+| 技術 | 關係 |
+|------|------|
+| **ReAct** | ToT 的基礎，單路徑版本 |
+| **Chain of Thought** | ToT 的簡化版，鏈狀思維 |
+| **MCTS** | ToT 的進階搜索算法 |
+| **Planning** | ToT 是規劃問題的核心技術 |
+
+---
+
 ## 延伸閱讀
 
 - [Tree of Thoughts Paper (arxiv)](https://arxiv.org/abs/2305.08291)
 - [LangChain ToT](https://python.langchain.com/docs/modules/agents/agent_types/tot)
 - [Google ToT Implementation](https://github.com/google-research/google-research/tree/master/tot)
+- [MCTS Survey](https://arxiv.org/abs/1909.13328)
+- [Self-Consistency in ToT](https://arxiv.org/abs/2203.11171)

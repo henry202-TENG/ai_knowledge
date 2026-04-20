@@ -724,3 +724,304 @@ LLM 調用 function
 - [OpenAI Function Calling Docs](https://platform.openai.com/docs/guides/function-calling)
 - [Anthropic Tool Use](https://docs.anthropic.com/en/docs/build-with-claude/tool-use)
 - [LangChain Tools](https://python.langchain.com/docs/modules/agents/tools/)
+
+---
+
+## 12. 進階主題：MCP 協議
+
+### 什麼是 MCP？
+
+MCP (Model Context Protocol) 是一個開放標準，讓 AI 模型能夠標準化地與外部系統和工具互動。
+
+### MCP vs 傳統 Function Calling
+
+| 特性 | 傳統 Function Calling | MCP |
+|------|----------------------|-----|
+| 標準化 | 每個平台不同 | 統一協議 |
+| 雙向溝通 | 單向 function 調用 | 雙向對話 |
+| 發現機制 | 靜態定義 | 動態發現 |
+| 狀態管理 | 無 | 有狀態會話 |
+
+### MCP 架構
+
+```
+┌─────────────┐      MCP      ┌─────────────┐
+│   LLM/Agent │ ◄─────────────► │  MCP Server │
+└─────────────┘               └──────┬──────┘
+                                     │
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+             ┌──────────┐     ┌──────────┐     ┌──────────┐
+             │  File    │     │   API    │     │ Database │
+             │  System  │     │  Gateway │     │  Server  │
+             └──────────┘     └──────────┘     └──────────┘
+```
+
+### MCP Tools 定義
+
+```json
+{
+  "name": "mcp-server-filesystem",
+  "version": "1.0.0",
+  "capabilities": {
+    "tools": {
+      "read_file": {
+        "description": "Read contents of a file",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"}
+          }
+        }
+      },
+      "write_file": {
+        "description": "Write content to a file",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### MCP 資源 (Resources)
+
+```json
+{
+  "resources": {
+    "uri": "file:///home/user/docs",
+    "name": "User Documents",
+    "mimeType": "application/directory"
+  }
+}
+```
+
+### MCP Prompt 模板
+
+```json
+{
+  "prompts": {
+    "analyze_code": {
+      "description": "Analyze code for issues",
+      "arguments": [
+        {"name": "language", "required": false},
+        {"name": "path", "required": true}
+      ]
+    }
+  }
+}
+```
+
+---
+
+## 13. A2A 協議 (Agent-to-Agent)
+
+### 什麼是 A2A？
+
+A2A 是一個讓不同 AI Agent 能夠相互溝通和協作的協議。
+
+### A2A vs MCP
+
+| 特性 | MCP | A2A |
+|------|-----|-----|
+| 層次 | Agent ↔ 工具 | Agent ↔ Agent |
+| 用途 | 單一 Agent 擴展能力 | 多 Agent 協作 |
+| 通訊 | 結構化 JSON | 訊息對話 |
+
+### A2A 訊息格式
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "msg-001",
+  "method": "tasks/send",
+  "params": {
+    "task": {
+      "id": "task-123",
+      "message": {
+        "role": "user",
+        "parts": [
+          {"type": "text", "text": "請幫我分析這個問題"}
+        ]
+      },
+      "history": []
+    }
+  }
+}
+```
+
+### A2A 能力協商
+
+```json
+{
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true,
+    "stateTransition": ["input", "working", "output"]
+  },
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Review",
+      "description": "擅長程式碼審查"
+    }
+  ]
+}
+```
+
+---
+
+## 14. 進階實作：Tool Runtime
+
+### 動態 Tool 註冊
+
+```python
+class DynamicToolRegistry:
+    def __init__(self):
+        self.tools = {}
+
+    def register(self, name: str, func: callable, schema: dict):
+        """動態註冊 Tool"""
+        self.tools[name] = {
+            "func": func,
+            "schema": schema,
+            "usage_count": 0
+        }
+
+    def unregister(self, name: str):
+        """動態移除 Tool"""
+        if name in self.tools:
+            del self.tools[name]
+
+    def get_tools(self):
+        """取得所有可用 Tools"""
+        return [
+            {"name": k, "schema": v["schema"]}
+            for k, v in self.tools.items()
+        ]
+```
+
+### Tool 版本管理
+
+```python
+class VersionedTool:
+    def __init__(self, name: str):
+        self.name = name
+        self.versions = {}  # version -> (func, schema)
+
+    def add_version(self, version: str, func, schema):
+        self.versions[version] = (func, schema)
+
+    def call(self, version: str, *args, **kwargs):
+        if version not in self.versions:
+            raise ValueError(f"Version {version} not found")
+        func, _ = self.versions[version]
+        return func(*args, **kwargs)
+```
+
+---
+
+## 15. 進階安全：Tool 審計
+
+### 呼叫日誌
+
+```python
+import logging
+from datetime import datetime
+
+class ToolAuditLogger:
+    def __init__(self, log_file: str):
+        self.logger = logging.getLogger("tool_audit")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.FileHandler(log_file)
+        self.logger.addHandler(handler)
+
+    def log_call(self, tool_name: str, args: dict, user: str, result: dict):
+        """記錄 Tool 呼叫"""
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "tool": tool_name,
+            "args": args,
+            "user": user,
+            "success": "error" not in result
+        }
+        self.logger.info(json.dumps(entry))
+```
+
+### 異常行為偵測
+
+```python
+class ToolAnomalyDetector:
+    def __init__(self, threshold: int = 100):
+        self.call_history = {}  # tool_name -> [timestamps]
+        self.threshold = threshold
+
+    def detect(self, tool_name: str) -> bool:
+        """偵測異常呼叫"""
+        now = time.time()
+        # 記錄這次呼叫
+        if tool_name not in self.call_history:
+            self.call_history[tool_name] = []
+        self.call_history[tool_name].append(now)
+
+        # 清除 1 分鐘前的記錄
+        self.call_history[tool_name] = [
+            t for t in self.call_history[tool_name]
+            if now - t < 60
+        ]
+
+        # 檢查是否超過閾值
+        return len(self.call_history[tool_name]) > self.threshold
+```
+
+---
+
+## 16. Tool 效能優化
+
+### 批量 Tool 呼叫
+
+```python
+async def batch_tool_calls(tools: list, max_concurrent: int = 5):
+    """批量執行 Tool 呼叫"""
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def call_with_limit(tool):
+        async with semaphore:
+            return await tool()
+
+    results = await asyncio.gather(*[call_with_limit(t) for t in tools])
+    return results
+```
+
+### Tool 結果快取
+
+```python
+from functools import lru_cache
+
+class CachedTool:
+    def __init__(self, func: callable, ttl: int = 300):
+        self.func = func
+        self.ttl = ttl
+        self.cache = {}
+
+    def _make_key(self, args, kwargs):
+        return hash((str(args), str(sorted(kwargs.items()))))
+
+    def __call__(self, *args, **kwargs):
+        key = self._make_key(args, kwargs)
+        now = time.time()
+
+        if key in self.cache:
+            result, timestamp = self.cache[key]
+            if now - timestamp < self.ttl:
+                return result
+
+        result = self.func(*args, **kwargs)
+        self.cache[key] = (result, now)
+        return result
+```
