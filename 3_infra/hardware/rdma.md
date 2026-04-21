@@ -6,6 +6,47 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**RDMA (Remote Direct Memory Access)** 是一種讓資料傳輸**繞過作業系統**的網路技術：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                 傳統 TCP/IP vs RDMA 傳輸路徑                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  傳統 TCP/IP:                                                        │
+│                                                                      │
+│  [應用] → [系統緩衝區] → [CPU處理] → [網卡驅動] → [網卡] → [網路]    │
+│                                                                      │
+│  步驟:                                                               │
+│  1. 資料從網卡到達                                                    │
+│  2. CPU 中斷處理                                                     │
+│  3. CPU 複製資料到用戶空間                                            │
+│  4. CPU 處理協議棧                                                   │
+│  5. CPU 複製資料到目標緩衝區                                          │
+│                                                                      │
+│  問題:                                                               │
+│  - CPU 每次傳輸都要參與                                              │
+│  - 多次記憶體拷貝                                                    │
+│  - 延遲: 數十微秒                                                    │
+│                                                                      │
+│  RDMA:                                                               │
+│                                                                      │
+│  [GPU A] ──────────────────────────────── [GPU B]                   │
+│     ↓                                            ↓                   │
+│  [RDMA NIC] ────── 直接記憶體傳輸 ──────── [RDMA NIC]                │
+│     ↓                                            ↓                   │
+│  [遠端記憶體寫入]                             [接收通知]            │
+│                                                                      │
+│  優勢:                                                               │
+│  - CPU 只參與初始化                                                  │
+│  - 零拷貝                                                           │
+│  - 延遲: < 1 微秒                                                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -75,6 +116,56 @@ RDMA 流程:
 | **Write** | 直接寫入遠端記憶體 | 梯度同步 |
 | **Read** | 直接讀取遠端記憶體 | 參數讀取 |
 | **Atomic** | 原子操作 | 分散式計數 |
+
+### 深度技術：記憶體註冊 (Memory Region)
+
+```python
+class RDMAMemoryRegion:
+    """
+    RDMA 記憶體註冊 - 核心概念
+    """
+
+    def __init__(self, pd):
+        self.pd = pd
+        self.memory_regions = []
+
+    def register_memory(self, buffer, access_flags):
+        """
+        註冊記憶體區域 (Memory Region - MR)
+
+        這是 RDMA 的核心:
+        - 讓網卡能直接訪問這塊記憶體
+        - 註冊後會獲得 remote key (rkey)
+        - 其他節點可以用 rkey 寫入這塊記憶體
+        """
+
+        mr = self.pd.reg_mr(
+            buffer=buffer,
+            length=len(buffer),
+            access=access_flags
+        )
+
+        # 保存註冊信息
+        mr_info = {
+            "addr": mr.buf,
+            "length": mr.length,
+            "lkey": mr.lkey,  # 本地 key
+            "rkey": mr.rkey   # 遠程 key - 給別人用來寫入
+        }
+
+        self.memory_regions.append(mr_info)
+
+        return mr_info
+
+    def get_remote_key(self, index=0):
+        """取得遠程訪問 key"""
+        mr = self.memory_regions[index]
+        return {
+            "addr": mr["addr"],
+            "rkey": mr["rkey"],
+            "length": mr["length"]
+        }
+```
 
 ### 傳輸模式
 

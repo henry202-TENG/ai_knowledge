@@ -6,6 +6,40 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**長上下文模型**的出現是為了解決 LLM 的「上下文瓶頸」：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    上下文長度的演進                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  時代 1: 2K-4K tokens                                               │
+│  ├── GPT-2: 1K                                                      │
+│  ├── GPT-3: 4K                                                      │
+│  └── 限制: 只能處理短文本                                           │
+│                                                                      │
+│  時代 2: 8K-32K tokens                                              │
+│  ├── GPT-3.5 Turbo: 16K                                            │
+│  ├── GPT-4: 32K                                                     │
+│  └── 突破: 完整論文、代碼文件                                       │
+│                                                                      │
+│  時代 3: 100K-1M+ tokens                                            │
+│  ├── Claude 2.1: 200K                                              │
+│  ├── GPT-4 Turbo: 128K                                             │
+│  ├── Gemini 1.5: 1M                                                │
+│  └── 突破: 完整書籍、代碼庫、對話歷史                                │
+│                                                                      │
+│  技術驅動:                                                           │
+│  - 注意力機制優化 (Sparse, Sliding Window)                          │
+│  - 位置編碼擴展 (RoPE, YARN)                                        │
+│  - 記憶體優化 (KV Cache 量化、分頁)                                  │
+│  - 分散式計算 (Ring Attention)                                      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -31,6 +65,99 @@
 2. GPU 記憶體爆炸 - KV Cache 太大
 3. 位置編碼失效 - 超過訓練長度
 4. 精度下降 - Softmax 溢出
+```
+
+### 深度挑戰分析
+
+#### 挑戰 1：注意力計算複雜度
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    注意力複雜度分析                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  標準 Self-Attention:                                                │
+│                                                                      │
+│  時間複雜度: O(n² × d)                                              │
+│  空間複雜度: O(n²)  (Attention Matrix)                              │
+│                                                                      │
+│  n = 序列長度，d = 隱藏維度                                          │
+│                                                                      │
+│  實際數據:                                                           │
+│  ┌─────────────┬──────────────┬──────────────┐                     │
+│  │ 序列長度    │ 計算量      │ 記憶體 (FP16) │                     │
+│  ├─────────────┼──────────────┼──────────────┤                     │
+│  │ 4K          │ 16M ops     │ 64 MB        │                     │
+│  │ 32K         │ 1B ops     │ 512 MB       │                     │
+│  │ 128K        │ 16B ops    │ 8 GB         │                     │
+│  │ 1M          │ 1T ops     │ 64 GB        │                     │
+│  └─────────────┴──────────────┴──────────────┘                     │
+│                                                                      │
+│  這解釋了為什麼需要稀疏注意力和 Flash Attention！                    │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 挑戰 2：位置編碼失效
+
+```python
+class PositionEncodingAnalysis:
+    """位置編碼失效分析"""
+
+    @staticmethod
+    def analyze_rope_failure(seq_len, base_freq=10000):
+        """
+        RoPE 在超長序列失效的原因
+        """
+
+        # 位置編碼公式: θ_i = base^(-2i/d)
+        freqs = 1.0 / (base_freq ** (np.arange(0, 128, 2) / 128))
+
+        # 問題: 位置差距過大時，相對位置信息丟失
+        for pos in [1000, 10000, 100000, 1000000]:
+            # 相鄰位置的角度差
+            adjacent_diff = freqs[0]  # cos(pos+1) - cos(pos) ≈ freq
+
+            # 遠距離位置的角度差
+            distant_diff = freqs[0] * pos  # cos(pos+M) - cos(pos)
+
+            # 問題: 當 distant_diff >> adjacent_diff 時，
+            # cos 函數會繞過多個週期，導致週期性混淆
+            print(f"Position {pos}: adjacent={adjacent_diff:.6f}, distant={distant_diff:.6f}")
+
+        return "位置編碼在長序列下失去區分度"
+```
+
+#### 挑戰 3：精度下降
+
+```python
+class SoftmaxStabilityAnalysis:
+    """Softmax 精度問題分析"""
+
+    @staticmethod
+    def analyze_softmax_overflow(q, k):
+        """
+        當序列太長時，QK^T 可能非常大
+        導致 softmax 計算不穩定
+        """
+
+        # 計算 QK^T
+        scores = torch.matmul(q, k.transpose(-2, -1))
+
+        # 問題: 如果 scores 的範圍太大
+        print(f"Score range: {scores.min():.2f} to {scores.max():.2f}")
+
+        # Softmax 公式: softmax(x_i) = exp(x_i - max(x)) / Σ exp(x_j - max(x))
+        # 問題: 沒有减去 max 值時，可能導致 exp 溢出
+
+        # 解決: 必須使用数值稳定的 softmax
+        def stable_softmax(x):
+            # 减去最大值避免溢出
+            x_max = x.max(dim=-1, keepdim=True)[0]
+            exp_x = torch.exp(x - x_max)
+            return exp_x / exp_x.sum(dim=-1, keepdim=True)
+
+        return stable_softmax(scores)
 ```
 
 ---

@@ -6,6 +6,38 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**Vector Database** 是專為高維向量設計的資料庫系統，其核心價值在於支援**近似最近鄰 (ANN) 搜尋**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                Vector Database 核心價值                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  傳統 DB 查詢:                                                       │
+│    SELECT * FROM docs WHERE content LIKE '%關鍵字%'                 │
+│    → 精確匹配                                                        │
+│    → 返回確定性結果                                                  │
+│                                                                      │
+│  Vector DB 查詢:                                                     │
+│    SELECT * FROM docs ORDER BY vector_distance(embedding, query)    │
+│    → 語義相似性                                                      │
+│    → 返回概率性結果 (Top-K)                                          │
+│                                                                      │
+│  關鍵差異:                                                           │
+│    ┌─────────────┬────────────────┬─────────────────┐              │
+│    │             │    傳統 DB     │   Vector DB     │              │
+│    ├─────────────┼────────────────┼─────────────────┤              │
+│    │ 查詢方式    │ 精確匹配       │ 近似匹配        │              │
+│    │ 相似度      │ = 或 !=        │ 距離度量        │              │
+│    │ 擴展性      │ O(log n)      │ O(log n) * ε   │              │
+│    │ 輸出        │ 確定性        │ 概率性          │              │
+│    └─────────────┴────────────────┴─────────────────┘              │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -31,6 +63,94 @@
 | **RAG 基礎設施** | 讓 LLM 能夠訪問外部知識 |
 | **長記憶體** | 讓 AI 記住對話歷史和知識 |
 | **可擴展性** | 支援十億級向量檢索 |
+
+### 深度價值分析
+
+#### 價值 1：解決「語義鴻溝」問題
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    語義鴻溝問題                                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  用戶輸入: "如何修復電腦無法開機的問題"                                │
+│                                                                      │
+│  傳統關鍵字檢索:                                                     │
+│    - 查詢關鍵字: ["修復", "電腦", "無法", "開機"]                     │
+│    - 返回: 只有包含這些確切詞彙的文檔                                 │
+│    - 問題: 漏掉 "電腦當機"、"開不了機"、"主機板故障" 等相關文檔        │
+│                                                                      │
+│  向量語義檢索:                                                       │
+│    - 將查詢轉為向量                                                  │
+│    - 找到語義相近的文檔                                              │
+│    - 結果包含: "主機板故障排除"、"電腦當機處理" 等                    │
+│                                                                      │
+│  底層原理:                                                           │
+│    - Embedding Model 學習了語義關係                                  │
+│    - "修復" 與 "排除" 在向量空間中相近                                │
+│    - "電腦" 與 "主機板" 在向量空間中相近                              │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 價值 2：支援「多模態」檢索
+
+```python
+class MultimodalVectorStore:
+    """多模態向量存儲"""
+
+    def __init__(self):
+        self.text_encoder = TextEncoder()
+        self.image_encoder = ImageEncoder()
+        self.video_encoder = VideoEncoder()
+
+    def index_document(self, doc):
+        """索引多模態文檔"""
+
+        embeddings = {}
+
+        if "text" in doc:
+            embeddings["text"] = self.text_encoder.encode(doc["text"])
+
+        if "image" in doc:
+            embeddings["image"] = self.image_encoder.encode(doc["image"])
+
+        if "video" in doc:
+            embeddings["video"] = self.video_encoder.encode(doc["video"])
+
+        # 存儲所有模態的向量
+        self.collection.add(
+            id=doc["id"],
+            vectors=embeddings,
+            metadata=doc["metadata"]
+        )
+
+    def search_multimodal(self, query, query_type="text", top_k=10):
+        """跨模態搜尋"""
+
+        # 將查詢編碼為對應模態的向量
+        if query_type == "text":
+            query_vec = self.text_encoder.encode(query)
+        elif query_type == "image":
+            query_vec = self.image_encoder.encode(query)
+
+        # 搜尋
+        return self.collection.search(
+            vector=query_vec,
+            top_k=top_k,
+            include=["metadatas", "documents"]
+        )
+```
+
+#### 價值 3：企業級可靠性
+
+| 需求 | Vector DB 提供的保障 |
+|------|---------------------|
+| **高可用性** | 複製、分片、故障轉移 |
+| **一致性** | 強一致性或最終一致性可選 |
+| **安全性** | RBAC、加密、審計 |
+| **合規性** | GDPR、CCPA 支援 |
+| **效能** | 毫秒級延遲、萬級 QPS |
 
 ---
 
@@ -127,6 +247,82 @@ candidates = vector_db.search(query, top_k=100)
 from rerankers import Reranker
 reranker = Reranker("cross-encoder")
 results = reranker.rank(query, candidates, top_k=10)
+```
+
+### 深度 Reranking 策略
+
+#### 1. 多階段 Reranking
+
+```python
+class MultiStageReranker:
+    """多階段排序"""
+
+    def __init__(self):
+        # Stage 1: Lightweight reranker (快速篩選)
+        self.light_ranker = CrossEncoder("lightweight-model")
+
+        # Stage 2: Heavy reranker (精確排序)
+        self.heavy_ranker = CrossEncoder("ms-marco-MiniLM-L-6-v2")
+
+        # Stage 3: Learning to Rank 模型
+        self.ltr_model = LTRModel()
+
+    def rank(self, query, candidates, top_k=10):
+        # Stage 1: 100 → 30
+        stage1 = self.light_ranker.predict(
+            [(query, doc) for doc in candidates[:100]]
+        )
+        stage1_top30 = sorted(
+            zip(candidates[:100], stage1),
+            key=lambda x: x[1],
+            reverse=True
+        )[:30]
+
+        # Stage 2: 30 → 10
+        stage2 = self.heavy_ranker.predict(
+            [(query, doc) for doc, _ in stage1_top30]
+        )
+        stage2_top10 = sorted(
+            zip([d for d, _ in stage1_top30], stage2),
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+
+        # Stage 3: LTR 重排
+        features = self._extract_features(query, stage2_top10)
+        final_scores = self.ltr_model.predict(features)
+
+        return [d for d, _ in sorted(
+            zip([d for d, _ in stage2_top10], final_scores),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]]
+```
+
+#### 2. 語義 Reranking
+
+```python
+class SemanticReranker:
+    """語義重排器 - 使用語義相似度"""
+
+    def __init__(self):
+        self.sentence_model = SentenceTransformer(
+            " paraphrase-multilingual-mpnet-base-v2"
+        )
+
+    def rerank(self, query, candidates, top_k=10):
+        # 編碼查詢和文檔
+        query_emb = self.sentence_model.encode(query)
+
+        doc_embs = self.sentence_model.encode(candidates)
+
+        # 計算語義相似度
+        similarities = np.inner(query_emb, doc_embs)
+
+        # 按相似度排序
+        ranked_indices = np.argsort(similarities)[::-1][:top_k]
+
+        return [candidates[i] for i in ranked_indices]
 ```
 
 ### 過濾器與向量混合

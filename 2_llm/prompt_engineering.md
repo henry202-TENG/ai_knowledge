@@ -6,6 +6,33 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**Prompt Engineering** 本質上是一種與 LLM 溝通的藝術和科學，其核心原理基於：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                Prompt Engineering 基礎原理                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  LLM 本質: 下一個 token 預測器                                        │
+│                                                                      │
+│  Prompt = 條件機率分佈的「控制訊號」                                   │
+│                                                                      │
+│  P(next_token | prompt, history)                                     │
+│                                                                      │
+│  好的 Prompt 的作用:                                                  │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  1. 縮小答案空間 - 明確輸出期望                                  │  │
+│  │  2. 激發相關知識 - 觸發模型內部相關表示                           │  │
+│  │  3. 建立推理框架 - 引導思考過程                                 │  │
+│  │  4. 控制風格/語氣 - 調整輸出特徵                                │  │
+│  │  5. 提供執行策略 - 給出具體行動指引                             │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -78,6 +105,98 @@ prompt = """
 # 結果: LLM 學會展示推理過程
 ```
 
+### 深度 CoT 技術
+
+#### 1. Self-Consistency (自我一致性)
+
+```python
+"""
+Self-Consistency 核心思想:
+讓 LLM 生成多條推理路徑，選擇最一致的答案
+
+Step 1: 使用 CoT 生成多個解答路徑
+Step 2: 選擇出現頻率最高的答案
+"""
+
+self_consistency_prompt = """
+讓我們用多種方法解答這個問題，然後比較結果：
+
+問題: {question}
+
+方法 1: [第一種解法]
+...
+答案: [答案 1]
+
+方法 2: [第二種解法]
+...
+答案: [答案 2]
+
+方法 3: [第三種解法]
+...
+答案: [答案 3]
+
+最終答案: [選擇最一致的答案]
+"""
+```
+
+#### 2. Tree of Thoughts (ToT)
+
+```python
+"""
+Tree of Thoughts:
+擴展 CoT 到樹狀結構，支援探索和回溯
+"""
+
+tot_prompt = """
+你是一個解決問題的決策樹。請探索多種可能的思考路徑：
+
+問題: {question}
+
+路徑 A:
+- 初始假設: ...
+- 推理步驟 1: ...
+- 推理步驟 2: ...
+- 結論: ...
+
+路徑 B:
+- 初始假設: ...
+- 推理步驟 1: ...
+- 結論: ...
+
+路徑 C:
+- 初始假設: ...
+- 推理步驟 1: ...
+- 結論: ...
+
+評估各路徑，選擇最佳解決方案:
+"""
+```
+
+#### 3. CoT + Few-shot 組合
+
+```python
+"""
+CoT + Few-shot 最強组合:
+"""
+
+cot_fewshot_prompt = """
+請一步步思考並回答以下問題。
+
+範例 1:
+問題: 5 個蘋果，每個 3 元，總共多少元？
+思考: 5 × 3 = 15
+答案: 15 元
+
+範例 2:
+問題: 一輛車每小時行駛 60 公里，3 小時行駛多少公里？
+思考: 60 × 3 = 180
+答案: 180 公里
+
+現在請回答:
+問題: {question}
+"""
+```
+
 ### ReAct (Reasoning + Acting)
 
 ```python
@@ -148,6 +267,152 @@ structure_prompt = """
 
 內容: [你的內容]
 """
+```
+
+---
+
+## 4.5 進階 Prompt 模式
+
+### 4.5.1 System Prompt 工程
+
+```python
+"""
+System Prompt 是最強大的 Prompt 類型之一
+"""
+
+# ❌ 弱 System Prompt
+system_prompt = "你是一個AI助手"
+
+# ✅ 強 System Prompt
+system_prompt = """
+你是一個專業的 {role}。
+
+專業領域: {domain}
+經驗水平: {experience_level}
+
+行為準則:
+1. {guideline_1}
+2. {guideline_2}
+3. {guideline_3}
+
+輸出約束:
+- 輸出語言: {language}
+- 格式要求: {format}
+- 長度限制: {length_limit}
+
+範例輸出:
+{examples}
+"""
+```
+
+### 4.5.2 Prompt 注入攻擊與防禦
+
+```python
+class PromptSecurity:
+    """Prompt 安全性處理"""
+
+    @staticmethod
+    def detect_injection(user_input: str) -> bool:
+        """檢測 Prompt 注入"""
+
+        dangerous_patterns = [
+            "忽略之前的指示",
+            "ignore previous",
+            "disregard",
+            "新的指令是",
+            "系統 prompt",
+            "你現在是",
+            "forget everything"
+        ]
+
+        for pattern in dangerous_patterns:
+            if pattern.lower() in user_input.lower():
+                return True
+
+        return False
+
+    @staticmethod
+    def sanitize_input(user_input: str) -> str:
+        """清理用戶輸入"""
+
+        # 移除可能的注入嘗試
+        sanitized = user_input
+
+        # 移除系統提示詞
+        system_keywords = ["system:", "prompt:", "instructions:"]
+        for keyword in system_keywords:
+            if keyword in sanitized.lower():
+                # 截斷之後的內容
+                sanitized = sanitized.lower().split(keyword)[0]
+
+        return sanitized.strip()
+
+    @staticmethod
+    def build_secure_prompt(
+        system_prompt: str,
+        user_input: str,
+        injection_detection: bool = True
+    ) -> dict:
+        """構建安全的 Prompt"""
+
+        if injection_detection and PromptSecurity.detect_injection(user_input):
+            user_input = "[過濾的輸入]"
+
+        return {
+            "system": system_prompt,
+            "user": user_input
+        }
+```
+
+### 4.5.3 Prompt 版本管理
+
+```python
+class PromptVersionManager:
+    """Prompt 版本管理"""
+
+    def __init__(self):
+        self.versions = {}
+        self.metrics = {}
+
+    def register_version(
+        self,
+        name: str,
+        prompt: str,
+        test_results: dict
+    ):
+        """註冊新版本"""
+
+        self.versions[name] = {
+            "prompt": prompt,
+            "test_results": test_results,
+            "timestamp": datetime.now(),
+            "performance_score": self._calculate_score(test_results)
+        }
+
+    def select_best_version(self, metric: str = "accuracy") -> str:
+        """選擇最佳版本"""
+
+        best_version = max(
+            self.versions.items(),
+            key=lambda x: x[1]["test_results"].get(metric, 0)
+        )
+
+        return best_version[0]
+
+    def ab_test(
+        self,
+        version_a: str,
+        version_b: str,
+        traffic_split: float = 0.5
+    ) -> dict:
+        """A/B 測試"""
+
+        return {
+            "version_a": version_a,
+            "version_b": version_b,
+            "traffic_split": traffic_split,
+            "metrics_to_track": ["latency", "accuracy", "user_satisfaction"]
+        }
 ```
 
 ---

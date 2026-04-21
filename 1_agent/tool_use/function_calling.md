@@ -6,6 +6,43 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**Function Calling** 是 LLM 與外部系統交互的核心能力，本質上是將 LLM 的**推理能力**與**執行能力**分離的設計模式：
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        Function Calling 架構                        │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│   ┌──────────┐    意圖識別    ┌──────────────┐    參數提取          │
+│   │ 用戶輸入  │ ───────────▶ │     LLM      │ ──────────────▶      │
+│   └──────────┘               │  (決策引擎)  │                      │
+│                               └──────────────┘                      │
+│                                        │                            │
+│                                        ▼                            │
+│                               ┌──────────────┐    執行調用            │
+│                               │ Tool Runtime │ ──────────────▶      │
+│                               └──────────────┘      外部 API        │
+│                                        │                            │
+│                                        ▼                            │
+│                               ┌──────────────┐    生成回覆            │
+│                               │     LLM      │ ◀─────────────       │
+│                               │  (生成引擎)  │    API 回傳結果        │
+│                               └──────────────┘                      │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 技術定位
+
+| 層次 | 技術 | 說明 |
+|------|------|------|
+| **應用層** | Agent Framework | LangChain, AutoGen |
+| **協議層** | MCP, A2A | 標準化工具調用 |
+| **能力層** | Function Calling | LLM 內建能力 |
+| **執行層** | Tool Runtime | 實際函數執行 |
+
 ### 簡單範例
 
 ```
@@ -40,6 +77,122 @@
 - **檔案操作**：讀取、寫入、搜尋
 - **API 整合**：CRM、ERP、電子商務
 - **程式碼執行**：Sandbox 環境運行代碼
+
+### 深度場景分析
+
+#### 場景 1：企業知識庫問答系統
+
+**挑戰**：
+- 文件版本管理困難
+- 跨系統知識整合
+- 準確性要求極高
+
+**Function Calling 解決方案**：
+```
+┌─────────────────────────────────────────────────────────┐
+│  用戶: "去年Q3的營收報告數據是多少？"                        │
+│                    │                                      │
+│                    ▼                                      │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Step 1: 意圖識別                                     │ │
+│  │   - 需要查詢營收數據                                 │ │
+│  │   - 需要特定時間範圍 (去年Q3)                        │ │
+│  └────────────────────────────────────────────────────┘ │
+│                    │                                      │
+│                    ▼                                      │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Step 2: 工具調用序列                                  │ │
+│  │   1. search_documents(query="Q3 營收報告 2024")   │ │
+│  │   2. get_financial_data(quarter="Q3", year=2024)  │ │
+│  │   3. compare_with_previous(data, period="Q2")     │ │
+│  └────────────────────────────────────────────────────┘ │
+│                    │                                      │
+│                    ▼                                      │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Step 3: 結果生成                                     │ │
+│  │   "根據2024年Q3財務報告，營收為..."                 │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 場景 2：多租戶 SaaS 系統
+
+**挑戰**：
+- 租戶隔離
+- 權限控制
+- 資源限制
+
+**解決方案架構**：
+```python
+class TenantAwareFunctionRegistry:
+    """租戶感知的工具註冊表"""
+
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+        self.allowed_tools = self._load_tenant_permissions()
+
+    def execute(self, tool_name: str, params: dict):
+        # 1. 權限檢查
+        if not self._check_permission(tool_name):
+            raise PermissionError(f"租戶 {self.tenant_id} 無權調用 {tool_name}")
+
+        # 2. 隔離執行
+        with TenantContext(self.tenant_id):
+            result = self._execute_tool(tool_name, params)
+
+        # 3. 審計日誌
+        self._log_access(tool_name, params, result)
+
+        return result
+```
+
+#### 場景 3：即時金融交易系統
+
+**挑戰**：
+- 延遲要求極高 (<100ms)
+- 數據一致性
+- 風險控制
+
+**優化策略**：
+```python
+class LowLatencyFunctionExecutor:
+    """低延遲函數執行器"""
+
+    def __init__(self):
+        # 預熱連接池
+        self._connection_pool = self._init_pool()
+        # 預編譯常用查詢
+        self._prepared_statements = {}
+        # 本地緩存
+        self._local_cache = LRUCache(maxsize=10000)
+
+    def execute_with_latency_budget(
+        self,
+        func: Callable,
+        params: dict,
+        budget_ms: float = 100
+    ) -> Result:
+        """在延遲預算內執行"""
+
+        start = time.perf_counter()
+
+        # 1. 快取查詢
+        cache_key = self._make_key(func, params)
+        if cached := self._local_cache.get(cache_key):
+            return cached
+
+        # 2. 執行（超時則回退）
+        try:
+            result = self._execute_with_timeout(func, params, budget_ms)
+        except TimeoutError:
+            # 回退到備用方案
+            result = self._fallback_execute(func, params)
+
+        # 3. 異步更新緩存
+        self._async_cache_update(cache_key, result)
+
+        return result
+```
 
 ---
 
@@ -174,6 +327,106 @@ messages = [
 | 結果整合 | LLM 自動 | 可選 |
 
 > 💡 LLM 已經過訓練，具備理解 function schema 並自動決策的能力。這也是 Function Calling 的核心價值 — **簡單、自動化**。
+
+### 深度原理：LLM 如何決定調用函數
+
+#### 決策流程深度解析
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      LLM Function Calling 決策流程                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. 輸入處理                                                          │
+│     ┌──────────────┐                                                │
+│     │ 用戶查詢 +    │                                                │
+│     │ Tool Schema  │                                                │
+│     └──────┬───────┘                                                │
+│            │                                                         │
+│            ▼                                                         │
+│  2. 語意匹配                                                          │
+│     ┌──────────────────────────────────────────────────────────┐   │
+│     │  LLM 內部:                                                 │   │
+│     │  - 理解用戶意圖                                            │   │
+│     │  - 比對 Tool Description                                   │   │
+│     │  - 評估每個工具的適用性                                      │   │
+│     │                                                            │   │
+│     │  關鍵問題: "這個查詢是否需要外部信息/操作？"                   │   │
+│     └──────────────────────────────────────────────────────────┘   │
+│            │                                                         │
+│            ▼                                                         │
+│  3. 參數提取                                                          │
+│     ┌──────────────────────────────────────────────────────────┐   │
+│     │  - 從用戶輸入提取必要參數                                    │   │
+│     │  - 類型轉換 (字串 → 數字/日期)                              │   │
+│     │  - 預設值處理                                               │   │
+│     │  - 驗證必需參數是否存在                                      │   │
+│     └──────────────────────────────────────────────────────────┘   │
+│            │                                                         │
+│            ▼                                                         │
+│  4. 輸出生成                                                          │
+│     ┌──────────────────────────────────────────────────────────┐   │
+│     │  tool_calls 格式:                                           │   │
+│     │  {                                                          │   │
+│     │    "name": "get_weather",                                   │   │
+│     │    "arguments": {"city": "台北", "unit": "celsius"}        │   │
+│     │  }                                                          │   │
+│     └──────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 內部機制：LLM 如何「理解」Tool Schema
+
+```python
+# Tool Schema 的關鍵設計原則
+
+schema = {
+    "name": "get_weather",
+    "description": "獲取指定城市的即時天氣資訊",  # ← LLM 據此判斷「何時」調用
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "city": {
+                "type": "string",
+                "description": "城市名稱，如 '台北'、'東京'"  # ← LLM 據此提取參數
+            },
+            "unit": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],  # ← 限制取值範圍
+                "default": "celsius"  # ← 處理可選參數
+            }
+        },
+        "required": ["city"]  # ← LLM 確保必需參數存在
+    }
+}
+
+"""
+LLM 內部處理解釋:
+
+1. 語意理解階段:
+   - "天氣" → 天氣相關工具
+   - "台北" → 匹配 city 參數
+   - "如何" → 需要獲取資訊 (非執行操作)
+
+2. 參數匹配階段:
+   - "台北" → 映射到 city 參數 (string type match)
+   - 缺少 unit → 使用預設值 "celsius"
+
+3. 驗證階段:
+   - 檢查 required: ["city"] → city 已提供 ✓
+   - 檢查 type: string → city 是字串 ✓
+"""
+```
+
+#### 決策邊界與極限情況
+
+| 情況 | LLM 行為 | 開發者應對 |
+|------|----------|-----------|
+| **參數不全** | 拒絕調用，詢問用戶 | 在 schema 中標記 required |
+| **意圖模糊** | 不調用，直接回答或詢問 | 改善 description |
+| **多工具適用** | 選擇最相關的一個 | 優化 description 區分度 |
+| **無需工具** | 正常生成回覆 | 這是正確行為 |
 
 ---
 
@@ -477,6 +730,123 @@ print(result)
 2. **錯誤處理要做好** — 捕獲 API 例外，返回有意義的錯誤訊息
 3. **安全性要注意** — 不要在 client 端直接暴露敏感 API key，驗證用戶輸入參數
 4. **善用 parallel calls** — 多個獨立的 function 可一次調用，提升效率
+
+### 深度挑戰與解決方案
+
+#### 挑戰 1：Tool Schema 設計不當導致誤調用
+
+**問題場景**：
+```json
+// ❌ 設計不良的 schema
+{
+  "name": "search",
+  "description": "搜尋資訊",
+  "parameters": {...}
+}
+```
+後果：LLM 過度傾向調用，任何問題都會嘗試 search
+
+**解決方案**：
+```json
+// ✅ 設計良好的 schema
+{
+  "name": "search_knowledge_base",
+  "description": "只在以下情況調用：
+    1. 用戶明確要求查詢內部文件/知識庫
+    2. 用戶詢問需要準確事實的問題
+    不要對一般性問題或主觀意見調用",
+  "parameters": {...}
+}
+```
+
+#### 挑戰 2：多層次依賴調用
+
+**問題場景**：
+```
+用戶: "幫我查詢最新一季蘋果公司的營收，然後發送郵件給 CFO"
+```
+需要：查詢 → 處理結果 → 發送郵件（依賴關係）
+
+**解決方案**：
+```python
+class DependencyAwareExecutor:
+    """依賴感知執行器"""
+
+    def execute_plan(self, tool_calls: list) -> list:
+        """分析並執行有依賴的調用計劃"""
+
+        # 1. 構建依賴圖
+        graph = self._build_dependency_graph(tool_calls)
+
+        # 2. 拓撲排序
+        execution_order = self._topological_sort(graph)
+
+        # 3. 按序執行
+        results = {}
+        for tool_call in execution_order:
+            # 替換依賴參數
+            resolved_params = self._resolve_dependencies(
+                tool_call.arguments,
+                results
+            )
+
+            # 執行
+            result = self._execute(tool_call.name, resolved_params)
+            results[tool_call.id] = result
+
+        return list(results.values())
+```
+
+#### 挑戰 3：Tool 返回結果過大
+
+**問題場景**：
+```python
+def get_all_company_docs():
+    """獲取所有公司文件"""
+    return fetch_thousands_of_documents()  # 返回 100MB+
+```
+後果：Context 溢出或處理緩慢
+
+**解決方案**：
+```python
+class ResultSizeController:
+    """結果大小控制器"""
+
+    MAX_RESULT_SIZE = 50 * 1024  # 50KB
+    MAX_ITEMS = 100
+
+    def truncate_result(self, result: dict, tool_name: str) -> dict:
+        """智慧截斷結果"""
+
+        # 1. 根據工具類型設定限制
+        limits = {
+            "get_documents": {"max_items": 10, "max_size": "10KB"},
+            "search_database": {"max_items": 50, "max_size": "30KB"},
+            "list_files": {"max_items": 100, "max_size": "20KB"}
+        }
+        limit = limits.get(tool_name, {"max_items": 10, "max_size": "10KB"})
+
+        # 2. 截斷過長結果
+        if isinstance(result, list) and len(result) > limit["max_items"]:
+            truncated = result[:limit["max_items"]]
+            return {
+                "data": truncated,
+                "_truncated": True,
+                "_total_count": len(result),
+                "_message": f"僅顯示前 {limit['max_items']} 項，共 {len(result)} 項"
+            }
+
+        # 3. 按大小截斷
+        result_str = json.dumps(result)
+        if len(result_str) > self._parse_size(limit["max_size"]):
+            return {
+                "data": result_str[:self._parse_size(limit["max_size"])] + "...",
+                "_truncated": True,
+                "_message": "結果已被截斷"
+            }
+
+        return result
+```
 
 ---
 
@@ -872,6 +1242,112 @@ A2A 是一個讓不同 AI Agent 能夠相互溝通和協作的協議。
     }
   ]
 }
+```
+
+---
+
+### 使用時機
+
+| 適合 Parallel | 不適合 Parallel |
+|---------------|-----------------|
+| 多個獨立的 API 呼叫 | 有依賴關係的呼叫 |
+| 查詢不同來源的資料 | 需前一結果作為下一輸入 |
+| 批量操作 | 順序邏輯 |
+
+### Parallel 深度優化
+
+#### 1. 智慧批次分組
+
+```python
+class SmartBatchGrouper:
+    """智慧批次分組 - 自動識別可並發的調用"""
+
+    def group_tool_calls(self, tool_calls: list) -> list[list]:
+        """將 tool calls 分組為可並發執行的批次"""
+
+        groups = []
+        current_group = []
+
+        for call in tool_calls:
+            # 檢查是否可加入當前組
+            if self._can_parallel(current_group, call):
+                current_group.append(call)
+            else:
+                # 提交當前組，開始新組
+                if current_group:
+                    groups.append(current_group)
+                current_group = [call]
+
+        # 提交最後一組
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    def _can_parallel(self, current_group: list, new_call: dict) -> bool:
+        """判斷是否可以並發執行"""
+
+        if not current_group:
+            return True
+
+        # 1. 檢查是否有依賴關係
+        for existing in current_group:
+            if self._has_dependency(existing, new_call):
+                return False
+
+        # 2. 檢查資源限制
+        total_cost = sum(self._estimate_cost(c) for c in current_group)
+        if total_cost + self._estimate_cost(new_call) > self.max_cost:
+            return False
+
+        return True
+```
+
+#### 2. 失敗容忍機制
+
+```python
+class FaultTolerantParallelExecutor:
+    """容錯並發執行器"""
+
+    def execute_parallel(self, tool_calls: list, max_concurrent: int = 5):
+        """並發執行，容忍部分失敗"""
+
+        results = []
+        failed_calls = []
+
+        # 使用信號量限制並發數
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def execute_with_error_handling(call):
+            try:
+                async with semaphore:
+                    result = await self._execute_async(call)
+                    return {"success": True, "call": call, "result": result}
+            except Exception as e:
+                return {"success": False, "call": call, "error": str(e)}
+
+        # 執行所有調用
+        task_results = await asyncio.gather(
+            *[execute_with_error_handling(tc) for tc in tool_calls],
+            return_exceptions=True
+        )
+
+        # 分離成功和失敗
+        for r in task_results:
+            if isinstance(r, dict) and r.get("success"):
+                results.append(r["result"])
+            else:
+                failed_calls.append(r.get("call") if isinstance(r, dict) else r)
+
+        # 重試失敗的調用（串行）
+        for call in failed_calls:
+            try:
+                result = await self._execute_async(call)
+                results.append(result)
+            except:
+                results.append({"error": f"調用失敗: {call}"})
+
+        return results
 ```
 
 ---

@@ -6,6 +6,35 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**Pipeline Parallelism (PP)** 是一種將模型按**層級**分割到多個 GPU 的並行策略：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Pipeline Parallelism 架構                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  模型層: L1 → L2 → L3 → L4 → L5 → L6 → L7 → L8                     │
+│                                                                      │
+│  分割方案 (4 GPUs):                                                   │
+│                                                                      │
+│  GPU 0:  L1 → L2      Stage 0                                       │
+│    ↓                                       ↓                         │
+│  GPU 1:  L3 → L4      Stage 1   資料在各 Stage 間流動               │
+│    ↓                                       ↓                         │
+│  GPU 2:  L5 → L6      Stage 2   像工廠管線一样                     │
+│    ↓                                       ↓                         │
+│  GPU 3:  L7 → L8      Stage 3                                       │
+│                                                                      │
+│  通訊模式:                                                            │
+│  - 只在相鄰 Stage 間傳遞 Activation 和 Gradient                     │
+│  - 通訊量: O(批次大小 × 隱藏維度)                                     │
+│  - 適合: 多節點叢集                                                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -114,6 +143,62 @@ micro-batch 後 Bubble: (P-1)/(P+M) (M = micro-batches 數量)
 例如 P=4, M=8:
   原始: 75%
   Micro-batch: 27%
+```
+
+### Bubble 深度分析
+
+```python
+"""
+Pipeline Bubble 深度分析
+"""
+
+def analyze_bubble(pipeline_stages, microbatches):
+    """
+    Bubble 時間和效率分析
+    """
+
+    p = pipeline_stages  # stages 數量
+    m = microbatches      # micro-batches 數量
+
+    # 理想情況 (無 bubble) 的總時間
+    ideal_time = m  # 每個 micro-batch 處理一次
+
+    # 實際 Bubble 時間 (使用 GPipe)
+    # 啟動階段: (P-1) 個 forward passes
+    # 結束階段: (P-1) 個 backward passes
+    bubble_time = 2 * (p - 1)
+
+    # 總時間
+    total_time = m + bubble_time
+
+    # 效率
+    efficiency = m / total_time
+
+    print(f"Pipeline Stages: {p}")
+    print(f"Micro-batches: {m}")
+    print(f"Bubble Time: {bubble_time}")
+    print(f"Total Time: {total_time}")
+    print(f"Efficiency: {efficiency:.2%}")
+
+    # 優化建議
+    if efficiency < 0.7:
+        print("⚠️  效率較低，建議:")
+        print("  - 增加 micro-batches 數量")
+        print("  - 減少 pipeline stages 數量")
+        print("  - 使用 1F1B 排程")
+
+    return efficiency
+
+
+# 實際範例
+print("=== P=4, M=8 ===")
+analyze_bubble(4, 8)  # ~73%
+
+print("\n=== P=4, M=32 ===")
+analyze_bubble(4, 32)  # ~94%
+
+print("\n=== P=8, M=32 ===")
+analyze_bubble(8, 32)  # ~80%
 ```
 
 ---

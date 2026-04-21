@@ -6,6 +6,44 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**Tensor Parallelism (TP)** 是模型並行的一種形式，與 Pipeline Parallelism 和 Data Parallelism 並列為三大並行策略。其核心特點是：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Tensor Parallelism 定位                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  層級關係:                                                           │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    訓練 / 推論                                 │  │
+│  └───────────────────────────────┬───────────────────────────────┘  │
+│                    ───────────────────────                          │
+│                    │                                               │
+│         ┌──────────┴──────────┐                                    │
+│         ▼                     ▼                                    │
+│  ┌─────────────┐       ┌─────────────┐                              │
+│  │ Model       │       │ Data        │                              │
+│  │ Parallelism │       │ Parallelism │                              │
+│  └──────┬──────┘       └──────┬──────┘                              │
+│         │                     │                                     │
+│    ┌────┴────┐                │                                     │
+│    ▼         ▼           ┌────┴────┐                                 │
+│ ┌──────┐ ┌──────┐        ▼         ▼                                │
+│ │Tensor│ │Pipe  │    ┌────────┐ ┌────────┐                          │
+│ │Parallel│ │Parallel│    │DDP    │ │FSDP   │                          │
+│ └──────┘ └──────┘    └────────┘ └────────┘                          │
+│                                                                      │
+│  Tensor Parallelism 特色:                                           │
+│  - 單層內的矩陣運算並行                                              │
+│  - 需要 GPU 間通訊 (AllReduce)                                      │
+│  - 適合單節點多 GPU (1-8 卡)                                        │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -148,6 +186,189 @@ Data Parallelism: 數據並行 (GPU 數 64+)
 **解決方案**：
 - 仔細設計切分策略
 - 使用虛擬管道
+
+### 深度挑戰分析
+
+#### 挑戰 3：非線性層的同步問題
+
+**問題描述**：
+```
+Transformer 中的非線性操作:
+- LayerNorm
+- Dropout
+- Activation (GELU, ReLU)
+
+這些操作需要在所有 GPU 上同步執行
+```
+
+**解決方案**：
+```python
+class SyncNonLinearLayers:
+    """同步非線性層"""
+
+    def __init__(self, tp_size):
+        self.tp_size = tp_size
+
+    def layer_norm(self, x):
+        """同步 LayerNorm"""
+
+        # 1. 先在本地計算
+        local_mean = x.mean(dim=-1, keepdim=True)
+        local_var = x.var(dim=-1, keepdim=True)
+
+        # 2. AllReduce 同步均值和方差
+        global_mean = self._all_reduce_mean(local_mean)
+        global_var = self._all_reduce_mean(local_var)
+
+        # 3. 使用全局統計量歸一化
+        normalized = (x - global_mean) / torch.sqrt(global_var + 1e-6)
+
+        # 4. 學習的 scale 和 bias 也需要同步
+        # (這些是 TP 獨立的，需要廣播)
+        return self.gamma * normalized + self.beta
+
+    def gelu(self, x):
+        """同步 GELU - 可以並行"""
+        # GELU 是元素級操作，不需要同步
+        return 0.5 * x * (1 + torch.tanh(
+            torch.sqrt(2 / 3.14159265359) * (x + 0.044715 * x**3)
+        ))
+```
+
+#### 挑戰 4：Embedding 層的切分
+
+**問題描述**：
+```
+Embedding 層的處理:
+- 輸入: token_ids [batch, seq]
+- 輸出: hidden_states [batch, seq, d_model]
+
+問題:
+- 如果按詞彙表切分 (vocab_parallel):
+  - 每個 GPU 只保存部分詞向量
+  - 查詢時需要 AllReduce 收集完整 embedding
+- 如果按隱藏維度切分:
+  - 輸出會不完整
+```
+
+**解決方案**：
+```python
+class ParallelEmbedding(nn.Module):
+    """並行 Embedding 層"""
+
+    def __init__(self, vocab_size, d_model, tp_size):
+        super().__init__()
+        self.tp_size = tp_size
+
+        # 按詞彙表切分
+        self.vocab_per_gpu = vocab_size // tp_size
+        self.embedding = nn.Embedding(
+            self.vocab_per_gpu,
+            d_model
+        )
+
+    def forward(self, token_ids):
+        # 假設 token_ids 已經重新映射到本地範圍
+        local_embeddings = self.embedding(token_ids)
+
+        # AllGather 收集完整的 embedding
+        # [batch, seq, d_model] × tp_size → [batch, seq, d_model × tp_size]
+        all_embeddings = torch.cat(
+            [local_embeddings]
+            + [torch.zeros_like(local_embeddings) for _ in range(self.tp_size - 1)],
+            dim=-1
+        )
+
+        dist.all_gather_into_tensor(all_embeddings, local_embeddings)
+
+        return all_embeddings
+```
+
+#### 挑戰 5：輸出層的處理
+
+**問題描述**：
+```
+輸出層 (LM Head):
+- 輸入: [batch, seq, d_model]
+- 輸出: [batch, seq, vocab_size]
+
+如果使用 vocab_parallel:
+- 每個 GPU 計算部分詞彙的 logits
+- 需要 AllReduce 合併後才能計算 loss
+```
+
+**解決方案**：
+```python
+class ParallelLMHead(nn.Module):
+    """並行 Language Modeling Head"""
+
+    def __init__(self, d_model, vocab_size, tp_size):
+        super().__init__()
+        self.tp_size = tp_size
+
+        # 按詞彙表切分
+        self.vocab_per_gpu = vocab_size // tp_size
+        self.linear = nn.Linear(
+            d_model,
+            self.vocab_per_gpu,
+            bias=False
+        )
+
+    def forward(self, hidden_states):
+        # 本地計算部分 logits
+        local_logits = self.linear(hidden_states)
+
+        # AllReduce 合併
+        # 每個 GPU 有 vocab_per_gpu 個 logit
+        # 合併後每個 GPU 有完整 vocab_size 個 logit
+        dist.all_reduce(local_logits, op=dist.ReduceOp.SUM)
+
+        return local_logits
+```
+
+#### 挑戰 6：梯度同步優化
+
+**問題描述**：
+```
+TP 的梯度同步:
+- 前向: 輸入廣播到所有 GPU
+- 反向: 梯度需要 AllReduce
+
+優化策略:
+1. 梯度 AllReduce 與計算重疊
+2. 混合精度訓練 (FP16/BF16)
+3. 梯度壓縮
+```
+
+**實現**：
+```python
+class TensorParallelOptimizer(torch.optim.Optimizer):
+    """TP 優化器 - 優化梯度同步"""
+
+    def __init__(self, params, tp_size):
+        super().__init__(params)
+        self.tp_size = tp_size
+
+    def step(self, closure=None):
+        # 1. 梯度同步 (異步)
+        for param in self.param_groups[0]['params']:
+            if param.grad is not None:
+                # 異步 AllReduce
+                handle = dist.all_reduce(
+                    param.grad,
+                    op=dist.ReduceOp.SUM,
+                    async_op=True
+                )
+
+                # 等待完成
+                handle.wait()
+
+                # 除以 TP size
+                param.grad.div_(self.tp_size)
+
+        # 2. 標準優化器 step
+        return super().step(closure)
+```
 
 ---
 

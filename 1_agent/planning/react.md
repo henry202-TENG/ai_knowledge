@@ -6,6 +6,41 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**ReAct (Reasoning + Acting)** 是一種讓 LLM 具備**工具使用能力**和**自主推理能力**的框架，其核心創新在於將「思考」與「行動」分離但交替進行：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ReAct 與傳統 LLM 的比較                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  傳統 LLM:                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Input → [LLM] → Output                                        │ │
+│  │                                                                  │ │
+│  │  問題:                                                          │ │
+│  │  - 不知道實時資訊 → 幻覺                                         │ │
+│  │  - 無法驗證事實 → 錯誤傳播                                       │ │
+│  │  - 推理過程不透明 → 難以除錯                                     │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ReAct:                                                             │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Input → [思考] → [行動] → [觀察] → [思考] → ... → Output    │ │
+│  │         ↓         ↓         ↓                                   │ │
+│  │       推理       工具       結果                                 │ │
+│  │       規劃       執行       反饋                                 │ │
+│  │                                                                  │ │
+│  │  優勢:                                                          │ │
+│  │  - 獲取真實資訊 → 減少幻覺                                       │ │
+│  │  - 驗證假設 → 避免錯誤傳播                                       │ │
+│  │  - 完整軌跡 → 可追蹤除錯                                         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -44,6 +79,79 @@ Step 2:
 輸出: "今天氣溫 25 度" ← 可能幻覺
 
 問題：LLM 不知道實時資訊，會胡亂猜測
+```
+
+### ReAct 解決的深層問題
+
+#### 1. 幻覺問題的解決
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ReAct 如何減少幻覺                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  傳統 LLM 的幻覺來源:                                                │
+│  - 訓練數據截至日期                                                 │
+│  - 無法訪問即時資訊                                                 │
+│  - 自信但錯誤的輸出                                                 │
+│                                                                      │
+│  ReAct 的解決方案:                                                   │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Step 1: 識別知識邊界                                          │  │
+│  │  "我需要查詢最新天氣數據來確認"                                 │  │
+│  │         ↓                                                       │  │
+│  │  Step 2: 主動獲取資訊                                          │  │
+│  │  Action: get_weather()                                         │  │
+│  │         ↓                                                       │  │
+│  │  Step 3: 基於事實推理                                          │  │
+│  │  Observation: 28°C → "今天氣溫28度"                           │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  關鍵: 思考 → 行動 → 觀察 → 形成反饋迴圈                            │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2. 推理可解釋性
+
+```python
+"""
+ReAct 提供了完整的推理軌跡
+"""
+
+class ReActTrace:
+    """完整推理軌跡"""
+
+    def __init__(self):
+        self.steps = []
+
+    def add_step(self, thought: str, action: str, observation: str):
+        self.steps.append({
+            "thought": thought,      # 推理過程
+            "action": action,       # 執行的行動
+            "observation": observation  # 觀察結果
+        })
+
+    def to_string(self) -> str:
+        """轉為可讀格式"""
+        lines = []
+        for i, step in enumerate(self.steps, 1):
+            lines.append(f"Step {i}:")
+            lines.append(f"  Thought: {step['thought']}")
+            lines.append(f"  Action: {step['action']}")
+            lines.append(f"  Observation: {step['observation']}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def analyze(self):
+        """分析推理軌跡"""
+        return {
+            "total_steps": len(self.steps),
+            "tools_used": set(s["action"].split("(")[0] for s in self.steps),
+            "has_error": any("error" in s["observation"].lower() for s in self.steps),
+            "completed": any("完成" in s["thought"] or "complete" in s["thought"].lower()
+                          for s in self.steps)
+        }
 ```
 
 ---
@@ -216,6 +324,148 @@ def handle_action_error(error, attempt=0):
 | **Think-Actor** | 先思考完整計畫，再執行 | 更謹慎 |
 | **Self-Ask** | 模型自己問自己問題 | 適合複雜推理 |
 | **Chain of Thought** | 只有 Thought，無 Action | 簡單推理 |
+
+### 深度變體分析
+
+#### 1. Reflexion (反思 Agent)
+
+```python
+"""
+Reflexion: 加入語義記憶的 ReAct 變體
+"""
+
+class ReflexionAgent:
+    """反思 Agent - 從過往錯誤中學習"""
+
+    def __init__(self):
+        self.memory = []  # 語義記憶
+        self.max_memory = 100
+
+    def react_with_reflection(self, query):
+        """帶反思的 ReAct"""
+
+        # 1. 檢索相關經驗
+        relevant_experiences = self._retrieve_experiences(query)
+
+        # 2. 構建包含反思的 Prompt
+        prompt = self._build_reflective_prompt(
+            query,
+            relevant_experiences
+        )
+
+        # 3. 標準 ReAct 執行
+        response = self._execute_react(prompt)
+
+        # 4. 反思結果
+        if not response.success:
+            self._store_failure(query, response)
+
+        return response
+
+    def _store_failure(self, query, response):
+        """存儲失敗經驗"""
+        # 提取失敗原因
+        failure_analysis = self._analyze_failure(response)
+
+        self.memory.append({
+            "query": query,
+            "failure": failure_analysis,
+            "timestamp": datetime.now()
+        })
+
+        # 維持記憶上限
+        if len(self.memory) > self.max_memory:
+            self.memory = self.memory[-self.max_memory:]
+```
+
+#### 2. Toolformer (工具學習)
+
+```python
+"""
+Toolformer: LLM 自學會使用工具
+"""
+
+class ToolformerTrainer:
+    """Toolformer 訓練器"""
+
+    def __init__(self, base_model, tools):
+        self.model = base_model
+        self.tools = tools
+
+    def train(self, corpus: list):
+        """
+        三階段訓練:
+        1. 工具調用生成
+        2. 結果預測
+        3. 損失優化
+        """
+
+        for text in corpus:
+            # Stage 1: 識別可使用工具的位置
+            tool_positions = self._find_tool_opportunities(text)
+
+            for pos in tool_positions:
+                # Stage 2: 生成工具調用
+                tool_call = self._generate_tool_call(
+                    text[pos:],
+                    self.tools
+                )
+
+                # Stage 3: 執行工具
+                result = self._execute_tool(tool_call)
+
+                # Stage 4: 構造訓練數據
+                training_example = self._create_training_example(
+                    text,
+                    tool_call,
+                    result
+                )
+
+                # Stage 5: 微調
+                self._fine_tune(training_example)
+```
+
+#### 3. Voyager ( Minecraft Agent)
+
+```python
+"""
+Voyager: 長期學習的 Minecraft Agent
+"""
+
+class VoyagerAgent:
+    """帶技能庫的 Agent"""
+
+    def __init__(self):
+        self.skill_library = {}  # 技能庫
+        self.environment = MinecraftEnv()
+
+    def learn_and_execute(self, task):
+        """學習執行新任務"""
+
+        # 1. 嘗試現有技能
+        if task in self.skill_library:
+            return self._execute_skill(task)
+
+        # 2. 沒有現成技能，嘗試 ReAct
+        success, trace = self._react_execute(task)
+
+        if success:
+            # 3. 成功，提取為新技能
+            skill = self._extract_skill(trace)
+            self.skill_library[task] = skill
+            self._store_skill(skill)
+
+        return trace
+
+    def _extract_skill(self, trace):
+        """從軌跡提取可複用技能"""
+
+        return {
+            "actions": [step["action"] for step in trace],
+            "conditions": self._extract_conditions(trace),
+            "template": self._generalize_template(trace)
+        }
+```
 
 ---
 

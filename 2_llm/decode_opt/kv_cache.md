@@ -6,6 +6,35 @@
 
 ## 1. 什麼是？
 
+### 深度定義
+
+**KV Cache** 是 Transformer 推論優化的基石技術，其核心價值在於利用 Transformer 的**自迴歸性質**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Transformer 自迴歸生成示意                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  時刻 t:                                                             │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Input: [Token₀, Token₁, ..., Token_{t-1}]                   │ │
+│  │                              ↓                                  │ │
+│  │  計算每個位置對最後位置的 Attention 贡献                        │ │
+│  │                              ↓                                  │ │
+│  │  Output: Token_t                                               │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  關鍵觀察:                                                            │
+│  - [Token₀, Token₁, ..., Token_{t-1}] 的 K, V 已經計算過             │
+│  - 這些 K, V 在後續所有時刻都會被重複使用                             │
+│  - 我們只需要計算新 token 的 K, V                                    │
+│                                                                      │
+│  這就是 KV Cache 要保存的內容！                                      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 簡單範例
 
 ```
@@ -163,6 +192,183 @@ def flash_decoding(q, kv_cache, block_size=512):
 - Split Prefill：分段處理
 - Chunked Prefill：小塊處理
 - 持續批處理
+
+### 深度挑戰與解決方案
+
+#### 挑戰 3：長上下文下的 Attention 計算瓶頸
+
+**問題描述**：
+```
+當序列長度達到 128K+ 時，Attention 計算成為瓶頸
+
+複雜度: O(n² × d)
+n = 128K 時:
+- Attention 計算量 ≈ 128K² × 128 ≈ 2×10¹² 運算
+- 即使使用 GPU，也需要數秒鐘
+```
+
+**解決方案 - Flash Attention 原理**：
+```python
+def flash_attention(Q, K, V, block_size=256):
+    """
+    Flash Attention: IO-aware exact attention
+
+    核心思想: 將 O(N²) 的 memory complexity 降低到 O(N)
+    通過分塊計算 + online softmax
+    """
+
+    # Q, K, V 形狀: [batch, heads, seq, head_dim]
+
+    num_blocks = (Q.shape[2] + block_size - 1) // block_size
+
+    # 分塊計算
+    output = torch.zeros_like(Q)
+
+    for i in range(num_blocks):
+        # 載入 Q 塊
+        q_block = Q[:, :, i*block_size:(i+1)*block_size, :]
+
+        # 計算這塊的 attention
+        # 使用 online softmax 技巧
+        for j in range(num_blocks):
+            # 載入 K, V 塊
+            k_block = K[:, :, j*block_size:(j+1)*block_size, :]
+            v_block = V[:, :, j*block_size:(j+1)*block_size, :]
+
+            # 計算 partial attention
+            attn_block = torch.matmul(q_block, k_block.transpose(-2, -1))
+
+            # 分塊 softmax
+            block_max = attn_block.max(dim=-1, keepdim=True)[0]
+            block_exp = torch.exp(attn_block - block_max)
+
+            # 累積到輸出
+            output[:, :, i*block_size:(i+1)*block_size, :] += \
+                torch.matmul(block_exp, v_block)
+
+    return output
+```
+
+#### 挑戰 4：多請求下的 KV Cache 衝突
+
+**問題描述**：
+```
+多個用戶請求同時進行時:
+- 每個請求需要獨立的 KV Cache
+- 記憶體碎片化
+- 請求之間的隔離困難
+```
+
+**解決方案 - vLLM 的 PagedAttention**：
+```python
+class PagedKVCache:
+    """
+    vLLM 的分頁 KV Cache 管理
+
+    核心設計:
+    - 將 KV Cache 劃分為固定大小的頁面
+    - 頁面不需要物理連續
+    - 頁面可以被多個請求共享
+    """
+
+    def __init__(self, page_size=16):
+        self.page_size = page_size
+        self.pages = {}  # page_id -> physical_memory
+        self.page_table = {}  # sequence_id -> [page_ids]
+
+    def allocate(self, sequence_id, max_length):
+        """為序列分配頁面"""
+
+        num_pages = (max_length + self.page_size - 1) // self.page_size
+
+        # 分配物理頁面
+        allocated_pages = []
+        for _ in range(num_pages):
+            page_id = self._allocate_free_page()
+            allocated_pages.append(page_id)
+
+        # 建立頁表映射
+        self.page_table[sequence_id] = allocated_pages
+
+        return allocated_pages
+
+    def append_token(self, sequence_id, token_id):
+        """追加新 token 到序列"""
+
+        # 找到當前位置對應的頁面
+        current_len = self.get_length(sequence_id)
+        page_idx = current_len // self.page_size
+        offset = current_len % self.page_size
+
+        # 如果需要新頁面
+        if offset == 0:
+            new_page = self._allocate_free_page()
+            self.page_table[sequence_id].append(new_page)
+
+        # 計算並存儲 KV
+        page_id = self.page_table[sequence_id][page_idx]
+        self._write_kv(page_id, offset, token_id)
+```
+
+#### 挑戰 5：KV Cache 預取延遲
+
+**問題描述**：
+```
+Decode 階段每生成一個 token 都需要:
+1. 讀取現有 KV Cache
+2. 計算新 token 的 K, V
+3. 寫入 KV Cache
+4. 計算 Attention
+
+當 GPU 計算太快時，記憶體讀取成為瓶頸
+```
+
+**解決方案 - 預取優化**：
+```python
+class PrefetchAwareScheduler:
+    """預取感知排程"""
+
+    def __init__(self, model):
+        self.model = model
+        self.prefetch_queue = asyncio.Queue()
+
+    async def schedule_with_prefetch(self, requests):
+        """調度 + 預取"""
+
+        # 預取下一批請求需要的 KV
+        next_batch = self._get_next_batch(requests)
+
+        prefetch_task = asyncio.create_task(
+            self._prefetch_kv(next_batch)
+        )
+
+        # 同時處理當前批次
+        current_batch = self._get_current_batch(requests)
+        results = await self._process_batch(current_batch)
+
+        # 等待預取完成
+        prefetched_kv = await prefetch_task
+
+        # 將預取的 KV 注入到下一批
+        self._inject_prefetched(next_batch, prefetched_kv)
+
+        return results
+
+    async def _prefetch_kv(self, batch):
+        """預先計算即將需要的 KV"""
+        prefetched = {}
+
+        for seq in batch:
+            # 預測下一批要處理的 token
+            next_tokens = self._predict_next(seq)
+
+            for token in next_tokens:
+                # 異步計算 K, V
+                kv = await self._compute_kv_async(token)
+                prefetched[(seq.id, token)] = kv
+
+        return prefetched
+```
 
 ---
 
