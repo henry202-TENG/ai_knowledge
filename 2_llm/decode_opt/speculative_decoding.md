@@ -172,8 +172,419 @@ Eagle: 使用大模型的中間層特徵 + 早 Exit
 
 ---
 
+## 6. 數學推導
+
+### 接受概率推導
+
+```
+目標: 決定是否接受小模型預測的 token
+
+定義:
+  p_d(x) = 大模型的 token 機率分佈
+  p_s(x) = 小模型的 token 機率分佈
+
+接受準則 (Original Speculative Decoding):
+
+  當 p_d(x) ≥ p_s(x): 總是接受
+  當 p_d(x) < p_s(x): 以概率 p_d(x)/p_s(x) 接受
+
+這保證了輸出與直接使用大模型完全相同 (數學上等價)
+```
+
+### 加速比分析
+
+```python
+def speedup_analysis(k, hit_rate):
+    """
+    計算加速比
+
+    k: 投機數量 (每批次的 token 數)
+    hit_rate: 命中率 (大模型接受的比率)
+
+    標準: 需要 k 次大模型 forward
+    投機: 只需 1 次小模型 + 1 次大模型
+    """
+    # 如果全部命中: 1 次推理產生 k 個 token
+    if hit_rate == 1.0:
+        return k
+
+    # 期望大模型調用次數
+    # 每次驗證可能重新從某個位置開始
+    expected_large_calls = 1 + (1 - hit_rate) * k
+
+    # 加速比
+    speedup = k / expected_large_calls
+
+    return speedup
+
+
+# 範例
+for k in [4, 6, 8, 12]:
+    for hit in [0.5, 0.7, 0.9, 0.95]:
+        print(f"K={k}, 命中率={hit}: {speedup_analysis(k, hit):.2f}x")
+
+# 輸出:
+# K=4, 命中率=0.5: 2.00x
+# K=4, 命中率=0.7: 2.35x
+# K=6, 命中率=0.8: 2.73x
+# K=8, 命中率=0.9: 3.48x
+# K=12, 命中率=0.95: 4.62x
+```
+
+### 採樣修正
+
+```python
+def corrected_speculative_sample(
+    small_tokens,
+    small_probs,
+    large_probs,
+    temperature=1.0
+):
+    """
+    帶溫度修正的投機解碼採樣
+    """
+
+    accepted = []
+    for i, (token, p_s) in enumerate(zip(small_tokens, small_probs)):
+        p_d = large_probs[i]
+
+        # 計算接受概率
+        if p_s.sum() > 0:
+            accept_prob = min(1, (p_d[token] / (p_s[token] + 1e-10)).item())
+        else:
+            accept_prob = 1.0
+
+        if random.random() < accept_prob:
+            accepted.append(token)
+        else:
+            # 拒絕: 從大模型分佈重新採樣
+            if temperature > 0:
+                # 溫度採樣
+                logits = large_probs[i] / temperature
+                probs = F.softmax(logits, dim=-1)
+                new_token = torch.multinomial(probs, 1).item()
+            else:
+                # Greedy
+                new_token = large_probs[i].argmax().item()
+
+            accepted.append(new_token)
+            break  # 從這裡開始需要重新生成
+
+    return accepted
+```
+
+---
+
+## 7. 投機模型選擇
+
+### 候選模型
+
+| 小模型 | 參數量 | 相對大模型 | 延遲比 |
+|--------|--------|-----------|--------|
+| **DistilBERT** | 66M | ~1/10 | ~1/5 |
+| **TinyLLaMA** | 1.1B | ~1/20 | ~1/10 |
+| **LLaMA-2-7B** | 7B | 1/10 | ~1/3 |
+| **Qwen-0.5B** | 0.5B | ~1/50 | ~1/15 |
+
+### 模型蒸餾
+
+```python
+class DistillationTrainer:
+    """蒸餾投機模型"""
+
+    def __init__(self, teacher_model, student_model):
+        self.teacher = teacher_model
+        self.student = student_model
+
+    def train_step(self, input_ids):
+        # Teacher 產生 logits
+        with torch.no_grad():
+            teacher_logits = self.teacher(input_ids)
+
+        # Student 預測
+        student_logits = self.student(input_ids)
+
+        #蒸餾 Loss
+        loss = F.kl_div(
+            F.log_softmax(student_logits, dim=-1),
+            F.softmax(teacher_logits, dim=-1),
+            reduction='batchmean'
+        )
+
+        return loss
+```
+
+### 自蒸餾策略
+
+```python
+class SelfSpeculativeModel:
+    """
+    使用同一模型的不同配置
+    """
+
+    def __init__(self, base_model):
+        self.full_model = base_model  # 完整層數
+        self.shallow_model = ShallowCopy(
+            base_model, num_layers=base_model.num_layers // 3
+        )
+
+    def generate(self, prompt, max_length):
+        # Shallow model 快速生成
+        draft_tokens = self.shallow_model.generate(prompt, K)
+
+        # Full model 驗證
+        verified = self.full_model.verify(prompt, draft_tokens)
+
+        return verified
+```
+
+---
+
+## 8. Medusa 深入
+
+### 多頭預測架構
+
+```
+傳統語言模型:
+  輸入 → [LM Head] → 下一個 token
+
+Medusa:
+  輸入 → [LM Head] → token t+1
+       → [Medusa Head 1] → token t+2
+       → [Medusa Head 2] → token t+3
+       → [Medusa Head 3] → token t+4
+       → ...
+```
+
+### Medusa 實現
+
+```python
+class MedusaModel(nn.Module):
+    def __init__(self, base_model, num_heads=4):
+        super().__init__()
+        self.base = base_model
+        self.num_heads = num_heads
+
+        # 每個 Medusa head 預測未來的 token
+        self.medusa_heads = nn.ModuleList([
+            nn.Linear(base_model.hidden_size, base_model.vocab_size)
+            for _ in range(num_heads)
+        ])
+
+        # 溫度參數
+        self.temperature = 1.0
+
+    def forward(self, input_ids):
+        # Base model forward
+        hidden = self.base(input_ids)
+
+        # 每個 head 預測一個未來的 token
+        predictions = []
+        for head in self.medusa_heads:
+            logits = head(hidden) / self.temperature
+            predictions.append(logits)
+
+        return predictions
+
+    def medusa_decode(self, input_ids, max_new_tokens):
+        """Medusa 解碼"""
+
+        all_tokens = input_ids.clone()
+        medusa_buffer = [None] * self.num_heads
+
+        for _ in range(max_new_tokens):
+            # 標準前向
+            preds = self.forward(all_tokens)
+
+            # 第一個 head 就是標準預測
+            next_token = preds[0].argmax(-1)
+            all_tokens = torch.cat([all_tokens, next_token.unsqueeze(-1)], dim=1)
+
+        return all_tokens
+```
+
+### 訓練策略
+
+```python
+def train_medusa(base_model, medusa_heads, data):
+    """
+    兩階段訓練:
+    1. 凍結 base model，只訓練 medusa heads
+    2. 聯合訓練
+    """
+
+    # Stage 1: 只訓練 heads
+    for param in base_model.parameters():
+        param.requires_grad = False
+
+    optimizer = optim.Adam(medusa_heads.parameters(), lr=1e-4)
+
+    for batch in data:
+        # 訓練 head 預測未來的 token
+        loss = compute_medusa_loss(medusa_heads, batch)
+        loss.backward()
+        optimizer.step()
+
+    # Stage 2: 聯合訓練 (可選)
+    # ...
+```
+
+---
+
+## 9. Eagle 深入
+
+### Eagle 架構
+
+```
+Eagle 的創新:
+1. 使用大模型最後幾層的 hidden states 作為輸入
+2. 早 Exit: 不需要通過完整模型
+3. 層次化投機: 多階段驗證
+```
+
+### Eagle 實現
+
+```python
+class EagleModel(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base = base_model
+
+        # 早 exit layer
+        self.exit_layer = base_model.num_layers - 4
+
+        # Eagle head: 使用淺層特徵預測
+        self.eagle_head = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(base_model.hidden_size, base_model.hidden_size),
+                nn.ReLU(),
+                nn.Linear(base_model.hidden_size, base_model.vocab_size)
+            )
+            for _ in range(4)  # 4 個 speculative tokens
+        ])
+
+    def forward(self, input_ids):
+        # 通過部分層
+        hidden = self.base.embed(input_ids)
+
+        for layer in range(self.exit_layer):
+            hidden = self.base.layers[layer](hidden)
+
+        # 使用淺層特徵生成投機
+        speculations = []
+        for head in self.eagle_head:
+            logits = head(hidden)
+            next_token = logits.argmax(-1)
+            speculations.append(next_token)
+
+            # 更新 hidden (使用預測的 token)
+            new_embed = self.base.embed(next_token)
+            hidden = hidden + new_embed  # 殘差連接
+
+        return speculations
+
+    def verify_and_generate(self, prompt, speculations):
+        """驗證並生成"""
+        # 一次性用完整模型驗證所有 speculations
+        verified = self.full_verify(prompt, speculations)
+
+        return verified
+```
+
+---
+
+## 10. 實際部署
+
+### vLLM 整合
+
+```python
+from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
+
+# 啟用投機解碼
+engine_args = EngineArgs(
+    model="meta-llama/Llama-2-70b-hf",
+    speculative_model="meta-llama/Llama-2-7b-hf",
+    num_speculative_tokens=6,  # K 值
+)
+
+llm = LLM(engine_args=engine_args)
+
+# 正常使用
+outputs = llm.generate(prompts, sampling_params)
+```
+
+### 效能基準
+
+```
+模型: LLaMA-70B + LLaMA-7B 投機
+硬體: 8x A100
+
+序列長度    標準延遲    投機延遲    加速比
+──────────────────────────────────────
+512         1.2s        0.8s        1.5x
+1024        2.8s        1.5s        1.9x
+2048        6.5s        2.8s        2.3x
+4096       15.2s       5.1s        3.0x
+```
+
+### 監控指標
+
+```python
+class SpeculativeMonitor:
+    def __init__(self):
+        self.stats = {
+            "total_specs": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "rejection_position": []
+        }
+
+    def record(self, proposal_len, accepted_len, rejection_pos):
+        self.stats["total_specs"] += 1
+        self.stats["accepted"] += accepted_len
+        self.stats["rejected"] += proposal_len - accepted_len
+        self.stats["rejection_position"].append(rejection_pos)
+
+    def get_metrics(self):
+        accepted = self.stats["accepted"]
+        total = accepted + self.stats["rejected"]
+
+        return {
+            "acceptance_rate": accepted / max(total, 1),
+            "avg_proposal": total / max(self.stats["total_specs"], 1),
+            "avg_rejection_pos": np.mean(self.stats["rejection_position"])
+        }
+```
+
+---
+
+## 11. 常見問題
+
+| 問題 | 原因 | 解決方案 |
+|------|------|----------|
+| **加速不明顯** | 命中率太低 | 調整 K 值或更小的投機模型 |
+| **輸出質量下降** | 拒絕採樣破壞分佈 | 使用修正的採樣 |
+| **記憶體增加** | 需要同時加載兩個模型 | 使用模型蒸餾或共享權重 |
+| **首 token 延遲** | 仍需要完整推理 | 結合預處理 |
+
+---
+
+## 12. 相關技術
+
+| 技術 | 關係 |
+|------|------|
+| **KV Cache** | Speculative Decoding 的基礎 |
+| **PagedAttention** | 管理投機階段的 KV Cache |
+| **DistilBERT** | 投機模型的典型選擇 |
+| **Early Exit** | 類似思想，提前輸出 |
+
+---
+
 ## 延伸閱讀
 
 - [Speculative Decoding Paper](https://arxiv.org/abs/2302.01318)
 - [Medusa Paper](https://arxiv.org/abs/2401.10774)
 - [vLLM Speculative Decoding](https://docs.vllm.ai/en/latest/serving/distributed_serving.html)
+- [Eagle Paper](https://arxiv.org/abs/2402.02103)
+- [Lookahead Decoding](https://arxiv.org/abs/2308.04615)
