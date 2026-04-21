@@ -162,8 +162,377 @@ Data Parallelism: 數據並行 (GPU 數 64+)
 
 ---
 
+## 8. 數學推導
+
+### Column Parallel 數學
+
+```
+輸入 X ∈ ℝᵇⁿˣᵈ (batch, seq, d_model)
+權重 W ∈ ℝᵈˣᵈff (d_model, d_ff)
+
+Column Parallel 切分:
+  W = [W₁, W₂, W₃, W₄], 每個 Wᵢ ∈ ℝᵈˣ(dff/4)
+  
+  Y = XW = X[W₁, W₂, W₃, W₄]
+    = [XW₁, XW₂, XW₃, XW₄]
+    = [Y₁, Y₂, Y₃, Y₄]
+
+每個 GPU 計算:
+  Yᵢ = X × Wᵢ
+
+AllReduce:
+  Y = AllReduce([Y₁, Y₂, Y₃, Y₄]) = Σᵢ Yᵢ
+```
+
+### Row Parallel 數學
+
+```
+Row Parallel 切分:
+  W = [W₁]
+      [W₂]
+      [W₃]
+      [W₄]  (dff/4, d_model)
+
+每個 GPU 計算:
+  Yᵢ = Xᵢ × Wᵢ  (只有部分輸入)
+
+AllReduce 聚合:
+  Y = Σᵢ Yᵢ
+```
+
+### 通訊量分析
+
+```
+假設:
+  - 隱藏維度: d = 4096
+  - FFN 維度: d_ff = 16384
+  - 序列長度: s = 2048
+  - GPU 數量: tp = 4
+
+Column Parallel:
+  - 輸入廣播: s × d = 2048 × 4096 = 8 MB
+  - AllReduce: s × d = 8 MB
+
+Row Parallel:
+  - AllReduce: s × (dff/tp) = 2048 × 4096 = 8 MB
+
+總通訊量 (每層):
+  = 2 × 8 MB = 16 MB
+  
+相比 Data Parallel (all-reduce 全部梯度):
+  = s × d × tp = 2048 × 4096 × 4 = 32 MB
+```
+
+---
+
+## 9. 實現細節
+
+### Megatron-LM 風格實現
+
+```python
+class ColumnParallelLinear(nn.Module):
+    """Column Parallel Linear Layer"""
+
+    def __init__(self, input_size, output_size, tp_size):
+        super().__init__()
+        self.tp_size = tp_size
+
+        # 沿 output_size 維度切分
+        self.weight = nn.Parameter(
+            torch.randn(output_size // tp_size, input_size)
+        )
+        self.bias = nn.Parameter(
+            torch.zeros(output_size // tp_size)
+        )
+
+    def forward(self, x):
+        # x: [batch, seq, input_size]
+
+        # 本地線性計算
+        output = F.linear(x, self.weight, self.bias)
+        # output: [batch, seq, output_size/tp_size]
+
+        # AllReduce 聚合結果
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """Row Parallel Linear Layer"""
+
+    def __init__(self, input_size, output_size, tp_size):
+        super().__init__()
+        self.tp_size = tp_size
+
+        # 沿 input_size 維度切分
+        self.weight = nn.Parameter(
+            torch.randn(output_size, input_size // tp_size)
+        )
+
+    def forward(self, x):
+        # x 已經是分片的 [batch, seq, input_size/tp_size]
+
+        # 本地線性計算
+        output = F.linear(x, self.weight)
+        # output: [batch, seq, output_size]
+
+        # AllReduce 聚合
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+
+        return output
+```
+
+### Attention 中的 TP
+
+```python
+class TensorParallelAttention(nn.Module):
+    """帶 TP 的 Multi-Head Attention"""
+
+    def __init__(self, d_model, num_heads, tp_size):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.tp_size = tp_size
+
+        self.head_dim = d_model // num_heads
+
+        # Q, K, V 使用 Column Parallel
+        self.query = ColumnParallelLinear(d_model, d_model, tp_size)
+        self.key = ColumnParallelLinear(d_model, d_model, tp_size)
+        self.value = ColumnParallelLinear(d_model, d_model, tp_size)
+
+        # Output 使用 Row Parallel
+        self.dense = RowParallelLinear(d_model, d_model, tp_size)
+
+    def forward(self, x, attention_mask=None):
+        # 計算 Q, K, V
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        # 沿 head 維度分片
+        # 每個 GPU 處理 num_heads / tp_size 個 heads
+        q = q.view(-1, self.num_heads // self.tp_size, self.head_dim)
+        k = k.view(-1, self.num_heads // self.tp_size, self.head_dim)
+        v = v.view(-1, self.num_heads // self.tp_size, self.head_dim)
+
+        # Attention 計算 (本地)
+        attn_output = self._attention(q, k, v, attention_mask)
+
+        # 輸出投影 (Row Parallel)
+        output = self.dense(attn_output)
+
+        return output
+```
+
+---
+
+## 10. 通訊優化
+
+### Overlap 通訊與計算
+
+```python
+class AsyncTensorParallel:
+    """將通訊與計算重疊"""
+
+    def __init__(self, tp_size):
+        self.tp_size = tp_size
+        self.stream = torch.cuda.Stream()
+
+    def forward_with_overlap(self, x, layer):
+        """
+        重疊 AllReduce 與計算
+        """
+
+        # 啟動非同步計算
+        with torch.cuda.stream(self.stream):
+            output = layer(x)
+
+        # 等待計算完成後進行通訊
+        torch.cuda.synchronize()
+
+        # 通訊 (另一個 stream)
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+
+        return output
+```
+
+### 批次通訊優化
+
+```python
+class BatchedAllreduce:
+    """批量 AllReduce 減少通訊次數"""
+
+    def __init__(self, tp_size):
+        self.tp_size = tp_size
+        self.pending_tensors = []
+        self.batch_size = 4
+
+    def add_and_reduce(self, tensor):
+        """累加張量並批量 reduce"""
+
+        self.pending_tensors.append(tensor)
+
+        if len(self.pending_tensors) >= self.batch_size:
+            return self._batch_reduce()
+
+        return None
+
+    def _batch_reduce(self):
+        """批量減少"""
+
+        # 堆疊張量
+        stacked = torch.stack(self.pending_tensors)
+
+        # 一次 AllReduce
+        dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+
+        # 分離
+        results = list(stacked.unbind(0))
+        self.pending_tensors.clear()
+
+        return results
+```
+
+---
+
+## 11. 3D Parallelism 整合
+
+### TP + PP + DP 組合
+
+```python
+class ThreeDParallelModel(nn.Module):
+    """3D Parallelism 模型"""
+
+    def __init__(self, config, tp_size=2, pp_size=2, dp_size=4):
+        super().__init__()
+        self.tp_size = tp_size
+        self.pp_size = pp_size
+        self.dp_size = dp_size
+
+        # 計算 ranks
+        self.tp_rank = self._get_tensor_model_parallel_rank()
+        self.pp_rank = self._get_pipeline_model_parallel_rank()
+        self.dp_rank = self._get_data_parallel_rank()
+
+        # 建立模型
+        self.layers = self._build_layers()
+
+    def _build_layers(self):
+        """建立分層模型"""
+
+        layers_per_stage = config.num_layers // self.pp_size
+
+        layers = nn.ModuleList([
+            self._build_transformer_layer(
+                layer_idx=self.pp_rank * layers_per_stage + i
+            )
+            for i in range(layers_per_stage)
+        ])
+
+        return layers
+
+    def forward(self, x):
+        # Pipeline Stage 內的 Forward
+        for layer in self.layers:
+            x = layer(x)
+
+            # TP 通信
+            if self.tp_size > 1:
+                dist.all_reduce(x, op=dist.ReduceOp.SUM)
+
+        return x
+```
+
+### 記憶體分析
+
+```
+3D Parallelism 記憶體分佈:
+
+假設:
+  - 模型: LLaMA 70B
+  - tp_size = 8
+  - pp_size = 4  
+  - dp_size = 4 (總 128 GPU)
+
+每個 GPU:
+  - 參數: 70B / 128 / 8 ≈ 70M 參數
+  - 梯度: 70M × 4 bytes = 280 MB
+  - Activations: 視序列長度而定
+  
+相比單 GPU:
+  - 需要 512 GB → 只需 8 GB
+```
+
+---
+
+## 12. 效能基準
+
+### 通訊量比較
+
+```
+模型: LLaMA 70B, 序列長度 2048
+
+| 方法      | 每層通訊量 | 總通訊量 |
+|-----------|-----------|----------|
+| Data Parallel | 32 MB    | 32 × 80 = 2.5 GB |
+| Tensor Parallel| 16 MB   | 16 × 80 = 1.3 GB |
+| Pipeline      | 8 MB     | 8 × 80 = 0.6 GB  |
+
+最佳: 結合 PP + TP + DP
+```
+
+### 加速比分析
+
+```
+訓練時間比較 (64 A100, 175B 模型):
+
+| 方法           | 時間 (小時) | 加速比 |
+|----------------|-------------|--------|
+| Data Parallel  | 40          | 1x     |
+| TP=8           | 32          | 1.25x  |
+| TP=8, PP=4     | 15          | 2.67x  |
+| TP×PP×DP       | 8           | 5x     |
+```
+
+---
+
+## 13. 常見問題
+
+| 問題 | 原因 | 解決方案 |
+|------|------|----------|
+| **負載不均** | 切分不均勻 | 調整 TP 大小或維度 |
+| **通訊瓶頸** | AllReduce 太慢 | 使用 NVLink |
+| **梯度不一致** | 同步問題 | 確保 AllReduce 完成 |
+| **記憶體不足** | 參數太多 | 增大 TP 或使用 ZeRO |
+
+### 調優參數
+
+| 參數 | 建議值 | 說明 |
+|------|--------|------|
+| **tensor_model_parallel_size** | 4-8 | 通常 8 是上限 |
+| **pipeline_model_parallel_size** | 2-8 | 視節點數量 |
+| **context_parallel_size** | 1-8 | 序列並行 |
+| **gradient_accumulation** | 視記憶體 | 增大 effective batch |
+
+---
+
+## 14. 相關主題
+
+| 技術 | 關係 |
+|------|------|
+| **Pipeline Parallelism** | 與 TP 常常結合使用 |
+| **NVLink** | GPU 互連影響 TP 效率 |
+| **AllReduce** | TP 的核心通訊操作 |
+| **3D Parallelism** | TP + PP + DP 組合 |
+
+---
+
 ## 延伸閱讀
 
 - [Megatron-LM Paper](https://arxiv.org/abs/1909.08053)
 - [Tensor Parallelism 詳解](https://github.com/NVIDIA/Megatron-LM)
 - [3D Parallelism](https://arxiv.org/abs/2205.05198)
+- [Megatron-LM v2](https://arxiv.org/abs/2205.05198)
+- [ColossalAI TP](https://www.colossalai.org/)

@@ -187,9 +187,352 @@ NCCL_SOCKET_IFNAME=eth0    # 指定網卡
 
 ---
 
+## 8. 數學分析
+
+### 延遲構成
+
+```
+RDMA 延遲組成:
+
+1. 連接建立 (首次):
+   - QP 建立: ~10-50μs
+   - MR 註冊: ~100-500μs
+
+2. 數據傳輸:
+   - 純傳輸延遲: ~0.5-1μs
+   - 網路傳播: ~0.1μs/m (光纖)
+   
+3. 總結:
+   - 單次 RDMA Write: ~1-2μs
+   - 傳統 TCP/IP: ~50-100μs
+   - 加速: 50-100x
+```
+
+### 頻寬計算
+
+```
+頻寬公式:
+
+BW = link_speed × encoding × lanes
+
+範例:
+  HDR InfiniBand:
+  - link_speed = 200 Gbps (每 lane)
+  - encoding = 64/66 (16b 編碼)
+  - lanes = 4
+  - 理論頻寬 = 200 × 64/66 × 4 / 8 ≈ 77 GB/s
+
+實際頻寬:
+  - 典型效率: 80-90%
+  - 實際頻寬 ≈ 60-70 GB/s
+```
+
+---
+
+## 9. 程式碼實作
+
+### RDMA 基本操作
+
+```python
+import pyverbs.cm as cm  # RDMA Connection Manager
+import pyverbs.device as d
+
+class RDMAConnection:
+    def __init__(self, device_name='mlx5_0'):
+        # 開啟設備
+        self.ctx = d.Context(name=device_name)
+
+        # 建立Protection Domain
+        self.pd = self.ctx.alloc_pd()
+
+        # 建立 Completion Queue
+        self.cq = self.ctx.create_cq(1000)
+
+    def create_queue_pair(self):
+        """建立 Queue Pair"""
+
+        # QP 屬性
+        qp_init_attr = rdp.QPInitAttr(
+            qp_type=rdp.QP_RC,  # Reliable Connection
+            send_cq=self.cq,
+            recv_cq=self.cq,
+            cap=rdp.QPCap(
+                max_send_wr=1000,
+                max_recv_wr=1000,
+                max_send_sge=10,
+                max_recv_sge=10
+            )
+        )
+
+        self.qp = self.pd.create_qp(qp_init_attr)
+
+    def register_memory(self, buffer):
+        """註冊記憶體區域"""
+
+        mr = self.pd.reg_mr(
+            buffer=buffer,
+            access=rdp.IBV_ACCESS_LOCAL_WRITE |
+                   rdp.IB V_ACCESS_REMOTE_WRITE |
+                   rdp.IB V_ACCESS_REMOTE_READ
+        )
+
+        return mr
+
+    def post_send(self, mr, remote_addr, rkey):
+        """發送 RDMA Write"""
+
+        # 建立 work request
+        wr = rdp.SendWR(
+            opcode=rdp.IBV_WR_RDMA_WRITE,
+            num_sge=1,
+            sg_list=[
+                rdp.SGE(
+                    lkey=mr.lkey,
+                    addr=mr.buf,
+                    length=mr.length
+                )
+            ],
+            wr_id=1
+        )
+
+        # 發送
+        self.qp.post_send(wr)
+
+        # 等待完成
+        self.cq.poll_completion()
+```
+
+### GPU Direct RDMA
+
+```python
+import cupy as cp
+import pyverbs
+
+class GPURDMA:
+    def __init__(self):
+        # 初始化 CUDA
+        self.stream = cp.cuda.Stream()
+
+        # 開啟 RDMA 設備
+        self.ctx = pyverbs.Context('mlx5_0')
+
+        # 建立 PD
+        self.pd = self.ctx.alloc_pd()
+
+    def register_gpu_memory(self, gpu_array):
+        """註冊 GPU 記憶體"""
+
+        # 取得 GPU 記憶體指標
+        gpu_ptr = gpu_array.data.ptr
+        size = gpu_array.nbytes
+
+        # 註冊為 RDMA MR
+        mr = self.pd.reg_mr(
+            addr=gpu_ptr,
+            length=size,
+            access=pyverbs.IBV_ACCESS_LOCAL_WRITE |
+                   pyverbs.IBV_ACCESS_REMOTE_WRITE
+        )
+
+        return mr
+
+    def remote_write(self, local_mr, remote_mr, size):
+        """RDMA Write 從 GPU 到遠端"""
+
+        wr = pyverbs.RDMASendWR(
+            opcode=pyverbs.IBV_WR_RDMA_WRITE,
+            remote_addr=remote_mr.addr,
+            rkey=remote_mr.rkey,
+            num_sge=1,
+            sg_list=[
+                pyverbs.SGE(
+                    lkey=local_mr.lkey,
+                    addr=local_mr.addr,
+                    length=size
+                )
+            ]
+        )
+
+        self.qp.post_send(wr)
+        self.cq.poll_completion()
+```
+
+---
+
+## 10. NCCL 整合深入
+
+### 自訂 RDMA 傳輸
+
+```python
+import torch.distributed as dist
+
+# 環境變數配置
+os.environ['NCCL_IB_DISABLE'] = '0'      # 啟用 InfiniBand
+os.environ['NCCL_IB_GID_INDEX'] = '3'    # GID 索引
+os.environ['NCCL_NET_PLUGIN'] = 'ibnetrdma'  # RDMA 外掛
+
+# 自訂通訊
+class RDMACollective:
+    def __init__(self, group):
+        self.group = group
+        self.stream = torch.cuda.Stream()
+
+    def allreduce_rdma(self, tensor):
+        """使用 RDMA 優化的 AllReduce"""
+
+        # 確保張量在 GPU 上
+        assert tensor.is_cuda
+
+        # NCCL 自動使用 RDMA
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.group)
+
+        return tensor
+
+    def broadcast_rdma(self, tensor, src):
+        """使用 RDMA 廣播"""
+
+        dist.broadcast(tensor, src=src, group=self.group)
+```
+
+### 效能監控
+
+```python
+class NCCLRDMAMonitor:
+    def __init__(self):
+        self.stats = {
+            "allreduce_latency": [],
+            "broadcast_latency": [],
+            "bytes_sent": []
+        }
+
+    @staticmethod
+    def enable_profiling():
+        """啟用 NCCL 效能分析"""
+
+        import os
+        os.environ['NCCL_DEBUG'] = 'WARN'
+        os.environ['NCCL_DEBUG_SUBSYS'] = 'ALL'
+
+    def profile_allreduce(self, tensor_size_mb, num_iterations=100):
+        """測試 AllReduce 效能"""
+
+        tensor = torch.randn(
+            tensor_size_mb * 1024 * 1024 // 4,
+            device='cuda'
+        )
+
+        # 預熱
+        for _ in range(10):
+            torch.distributed.all_reduce(tensor)
+
+        torch.cuda.synchronize()
+
+        # 基準測試
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        for _ in range(num_iterations):
+            torch.distributed.all_reduce(tensor)
+        end.record()
+
+        torch.cuda.synchronize()
+
+        elapsed_ms = start.elapsed_time(end)
+        avg_latency = elapsed_ms / num_iterations
+        bandwidth_gbps = (tensor_size_mb * num_iterations * 1000) / elapsed_ms
+
+        return {
+            "latency_ms": avg_latency,
+            "bandwidth_gbps": bandwidth_gbps,
+            "efficiency": bandwidth_gbps / 400  # 假設 400 GB/s
+        }
+```
+
+---
+
+## 11. 網路拓撲
+
+### 典型叢集拓撲
+
+```
+典型 AI 訓練叢集 (32 GPU, 4 節點):
+
+                    ┌─────────────┐
+                    │  InfiniBand │
+                    │   Switch    │
+                    │   HDR 200G  │
+                    └──────┬──────┘
+           ┌──────────────┼──────────────┐
+           │              │              │
+     ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+     │  節點 0   │  │  節點 1   │  │  節點 2   │
+     │ 8x H100   │  │ 8x H100   │  │ 8x H100   │
+     │ NVSwitch  │  │ NVSwitch  │  │ NVSwitch  │
+     └───────────┘  └───────────┘  └───────────┘
+
+節點內: NVLink (900 GB/s)
+節點間: InfiniBand HDR (200 Gbps per port)
+```
+
+### 路由優化
+
+```bash
+# 檢查網路拓撲
+ibnetdiscover
+
+# 檢查 RDMA 網路狀態
+ibstat
+
+# 效能測試
+ib_send_bw -d mlx5_0 -s 4096 -n 1000
+```
+
+---
+
+## 12. 常見問題
+
+| 問題 | 原因 | 解決方案 |
+|------|------|----------|
+| **連接建立失敗** | 防火牆阻擋 | 開放相關連接埠 |
+| **頻寬低** | MTU 過小 | 設定 MTU 4096 |
+| **延遲高** | 軟體堆疊問題 | 使用硬體 RDMA |
+| **記憶體不足** | MR 過多 | 合併記憶體區域 |
+
+### 診斷工具
+
+```bash
+# 檢查 RDMA 設備
+ibv_devices
+
+# 檢查網卡狀態
+ip link show
+
+# 測試 RDMA 連接
+rping -s -a <server_ip> -c 100 &
+rping -c -a <client_ip> -C 100
+
+# 監控網路流量
+perfquery
+```
+
+---
+
+## 13. 與相關技術的關係
+
+| 技術 | 關係 |
+|------|------|
+| **NVLink/NVSwitch** | 節點內 GPU 互連 |
+| **InfiniBand** | RDMA 的主要實現 |
+| **Tensor Parallelism** | 受益於 RDMA 的通訊 |
+| **NCCL** | NVIDIA 通訊庫，支援 RDMA |
+
+---
+
 ## 延伸閱讀
 
 - [RDMA 基礎教學](https://www.mellanox.com/rdma)
 - [NCCL RDMA](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html)
 - [InfiniBand Architecture](https://www.infinibandta.org/)
 - [GPU Direct RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/)
+- [RDMA Programming](https://www.mellanox.com/products/rdma-tools)
